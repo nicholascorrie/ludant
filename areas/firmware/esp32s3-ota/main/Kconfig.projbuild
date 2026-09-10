@@ -1,0 +1,23 @@
+menu "Ludant firmware"
+
+config LUDANT_FIRMWARE_VERSION
+    string "Firmware version"
+    default "0.1.0"
+    help
+        Version reported by the Device Info characteristic when the build
+        does not provide another application version.
+
+config LUDANT_OTA_WINDOW_SECONDS
+    int "OTA permission window after boot (seconds)"
+    range 1 3600
+    default 120
+
+config LUDANT_BOOT_BUTTON_GPIO
+    int "BOOT button GPIO"
+    range 0 48
+    default 0
+    help
+        The standard ESP32-S3 development-board BOOT button is GPIO0 and is
+        active low. Holding it permits OTA outside the normal boot window.
+
+endmenu

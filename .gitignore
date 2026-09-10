@@ -48,3 +48,9 @@ Thumbs.db
 .nx/polygraph
 .nx/self-healing
 .nx/migrate-runs
+
+# ESP-IDF generated output
+areas/firmware/esp32s3-ota/build/
+areas/firmware/esp32s3-ota/sdkconfig
+areas/firmware/esp32s3-ota/sdkconfig.old
+areas/firmware/esp32s3-ota/dependencies.lock

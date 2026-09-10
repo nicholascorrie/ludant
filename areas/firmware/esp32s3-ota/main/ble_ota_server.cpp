@@ -1,0 +1,561 @@
+#include "ble_ota_server.hpp"
+
+#include <algorithm>
+#include <cassert>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+#include "cJSON.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "host/ble_hs.h"
+#include "host/ble_uuid.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "os/os_mbuf.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+#include "store/config/ble_store_config.h"
+
+namespace {
+constexpr char TAG[] = "ble_ota";
+// Keep the complete service UUID and the name inside the legacy 31-byte
+// advertising payload so discovery works without relying on scan response.
+constexpr char kDeviceName[] = "Ludant";
+constexpr size_t kMaxControlJson = 8192;
+constexpr size_t kMaxFramedControlJson = 2047;
+constexpr size_t kCopyChunkSize = 1024;
+constexpr uint8_t kCommandFrameMagic = 0xC2;
+constexpr uint8_t kCommandFrameVersion = 1;
+constexpr size_t kCommandFrameHeaderLength = 12;
+
+// NimBLE's BLE_UUID128_INIT takes the UUID bytes in little-endian order.
+// These bytes render as 7A910000-4C5E-4A9B-8F23-91F4A7D10000.
+static const ble_uuid128_t kServiceUuid = BLE_UUID128_INIT(
+    0x00, 0x00, 0xd1, 0xa7, 0xf4, 0x91, 0x23, 0x8f,
+    0x9b, 0x4a, 0x5e, 0x4c, 0x00, 0x00, 0x91, 0x7a);
+static const ble_uuid128_t kControlUuid = BLE_UUID128_INIT(
+    0x00, 0x00, 0xd1, 0xa7, 0xf4, 0x91, 0x23, 0x8f,
+    0x9b, 0x4a, 0x5e, 0x4c, 0x01, 0x00, 0x91, 0x7a);
+static const ble_uuid128_t kDataUuid = BLE_UUID128_INIT(
+    0x00, 0x00, 0xd1, 0xa7, 0xf4, 0x91, 0x23, 0x8f,
+    0x9b, 0x4a, 0x5e, 0x4c, 0x02, 0x00, 0x91, 0x7a);
+static const ble_uuid128_t kStatusUuid = BLE_UUID128_INIT(
+    0x00, 0x00, 0xd1, 0xa7, 0xf4, 0x91, 0x23, 0x8f,
+    0x9b, 0x4a, 0x5e, 0x4c, 0x03, 0x00, 0x91, 0x7a);
+static const ble_uuid128_t kDeviceInfoUuid = BLE_UUID128_INIT(
+    0x00, 0x00, 0xd1, 0xa7, 0xf4, 0x91, 0x23, 0x8f,
+    0x9b, 0x4a, 0x5e, 0x4c, 0x04, 0x00, 0x91, 0x7a);
+
+static uint16_t control_handle = 0;
+static uint16_t data_handle = 0;
+static uint16_t status_handle = 0;
+static uint16_t device_info_handle = 0;
+
+static int accessCallback(uint16_t conn_handle, uint16_t attr_handle,
+                          struct ble_gatt_access_ctxt* ctxt, void* arg) {
+    return BleOtaServer::gattAccessCallback(conn_handle, attr_handle, ctxt, arg);
+}
+
+static const struct ble_gatt_svc_def services[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &kServiceUuid.u,
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                .uuid = &kControlUuid.u,
+                .access_cb = accessCallback,
+                .flags = BLE_GATT_CHR_F_WRITE,
+                .val_handle = &control_handle,
+            },
+            {
+                .uuid = &kDataUuid.u,
+                .access_cb = accessCallback,
+                .flags = BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE,
+                .val_handle = &data_handle,
+            },
+            {
+                .uuid = &kStatusUuid.u,
+                .access_cb = accessCallback,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &status_handle,
+            },
+            {
+                .uuid = &kDeviceInfoUuid.u,
+                .access_cb = accessCallback,
+                .flags = BLE_GATT_CHR_F_READ,
+                .val_handle = &device_info_handle,
+            },
+            { 0 },
+        },
+    },
+    { 0 },
+};
+}
+
+BleOtaServer* BleOtaServer::instance_ = nullptr;
+
+BleOtaServer::BleOtaServer(OtaManager& ota_manager, const DeviceInfo& device_info, ModuleManager& module_manager)
+    : ota_manager_(ota_manager), device_info_(device_info), module_manager_(module_manager) {
+    instance_ = this;
+    ota_manager_.setStatusCallback(statusCallback, this);
+    module_manager_.setOutputCallback(moduleCallback, this);
+}
+
+esp_err_t BleOtaServer::start() {
+    const esp_err_t nimble_err = nimble_port_init();
+    if (nimble_err != ESP_OK) {
+        ESP_LOGE(TAG, "NimBLE initialization failed: %s", esp_err_to_name(nimble_err));
+        return nimble_err;
+    }
+
+    ble_hs_cfg.reset_cb = onBleReset;
+    ble_hs_cfg.sync_cb = onBleSync;
+    ble_hs_cfg.gatts_register_cb = gattRegisterCallback;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    ble_svc_gap_device_name_set(kDeviceName);
+
+    int rc = ble_gatts_count_cfg(services);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Failed to count GATT configuration: %d", rc);
+        return ESP_FAIL;
+    }
+    rc = ble_gatts_add_svcs(services);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Failed to add GATT services: %d", rc);
+        return ESP_FAIL;
+    }
+
+    ble_store_config_init();
+    nimble_port_freertos_init([](void*) { nimble_port_run(); });
+    return ESP_OK;
+}
+
+void BleOtaServer::statusCallback(const char* message, void* context) {
+    static_cast<BleOtaServer*>(context)->handleStatus(message);
+}
+
+void BleOtaServer::moduleCallback(const char* message, void* context) {
+    static_cast<BleOtaServer*>(context)->handleStatus(message);
+}
+
+void BleOtaServer::handleStatus(const char* message) {
+    if (message == nullptr) {
+        return;
+    }
+    std::strncpy(last_status_, message, sizeof(last_status_) - 1);
+    notifyStatus(message);
+    if (std::strcmp(message, "SUCCESS") == 0) {
+        scheduleRestart();
+    }
+}
+
+void BleOtaServer::notifyStatus(const char* message) {
+    if (!status_notifications_enabled_ || connection_handle_ == BLE_HS_CONN_HANDLE_NONE) {
+        return;
+    }
+
+    const size_t message_length = std::strlen(message);
+    struct os_mbuf* buffer = ble_hs_mbuf_from_flat(message, message_length);
+    if (buffer == nullptr) {
+        ESP_LOGE(TAG, "Could not allocate notification buffer");
+        return;
+    }
+
+    const int rc = ble_gatts_notify_custom(connection_handle_, status_handle, buffer);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "Status notification failed: %d", rc);
+    }
+}
+
+void BleOtaServer::handleDisconnect() {
+    status_notifications_enabled_ = false;
+    connection_handle_ = BLE_HS_CONN_HANDLE_NONE;
+    ota_manager_.onDisconnect();
+    module_manager_.stopTelemetry();
+}
+
+int BleOtaServer::handleRead(uint16_t attr_handle, struct ble_gatt_access_ctxt* ctxt) {
+    std::string value;
+    if (attr_handle == status_handle) {
+        value = last_status_;
+    } else if (attr_handle == device_info_handle) {
+        value = device_info_.json();
+    } else {
+        return BLE_ATT_ERR_READ_NOT_PERMITTED;
+    }
+
+    return os_mbuf_append(ctxt->om, value.data(), value.size()) == 0
+        ? 0
+        : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+int BleOtaServer::handleControlWrite(struct ble_gatt_access_ctxt* ctxt) {
+    const uint16_t length = OS_MBUF_PKTLEN(ctxt->om);
+    if (length == 0 || length > kMaxControlJson) {
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+
+    uint8_t first_byte = 0;
+    if (os_mbuf_copydata(ctxt->om, 0, 1, &first_byte) != 0) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    if (first_byte == kCommandFrameMagic) {
+        std::vector<uint8_t> frame(length);
+        if (os_mbuf_copydata(ctxt->om, 0, length, frame.data()) != 0) {
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        return processCommandFrame(frame.data(), frame.size())
+            ? 0
+            : BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+
+    std::string message(length, '\0');
+    if (os_mbuf_copydata(ctxt->om, 0, length, &message[0]) != 0) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    return handleCompleteControlWrite(message.c_str(), length);
+}
+
+int BleOtaServer::handleCompleteControlWrite(const char* message, size_t length) {
+    if (message == nullptr || length == 0 || length > kMaxControlJson) {
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+    cJSON* root = cJSON_ParseWithLength(message, length);
+    if (root == nullptr) {
+        ota_manager_.abort("malformed control JSON");
+        handleStatus("ERROR:INVALID_JSON:control message is not valid JSON");
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+
+    const cJSON* command_item = cJSON_GetObjectItemCaseSensitive(root, "command");
+    if (!cJSON_IsString(command_item) || command_item->valuestring == nullptr) {
+        cJSON_Delete(root);
+        handleStatus("ERROR:INVALID_COMMAND:command is required");
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+
+    bool accepted = false;
+    if (std::strcmp(command_item->valuestring, "begin") == 0) {
+        const cJSON* size_item = cJSON_GetObjectItemCaseSensitive(root, "size");
+        const cJSON* sha_item = cJSON_GetObjectItemCaseSensitive(root, "sha256");
+        const cJSON* version_item = cJSON_GetObjectItemCaseSensitive(root, "version");
+        if (cJSON_IsNumber(size_item) && cJSON_IsString(sha_item) && cJSON_IsString(version_item) &&
+            size_item->valuedouble >= 1.0 && size_item->valuedouble <= 4294967295.0 &&
+            size_item->valuedouble == static_cast<double>(static_cast<uint32_t>(size_item->valuedouble))) {
+            accepted = ota_manager_.begin(
+                static_cast<uint32_t>(size_item->valuedouble),
+                sha_item->valuestring,
+                version_item->valuestring);
+        } else {
+            handleStatus("ERROR:INVALID_BEGIN:begin requires integer size, sha256, and version");
+        }
+    } else if (std::strcmp(command_item->valuestring, "end") == 0) {
+        accepted = ota_manager_.finish();
+    } else if (std::strcmp(command_item->valuestring, "abort") == 0) {
+        ota_manager_.abort("client requested abort");
+        accepted = true;
+    } else {
+        accepted = module_manager_.handleCommand(message, length);
+    }
+
+    cJSON_Delete(root);
+    return accepted ? 0 : BLE_ATT_ERR_UNLIKELY;
+}
+
+namespace {
+uint16_t readLittleEndian16(const uint8_t* data) {
+    return static_cast<uint16_t>(data[0]) |
+           static_cast<uint16_t>(data[1]) << 8;
+}
+
+uint16_t crc16Bytes(const uint8_t* data, size_t length) {
+    uint16_t crc = 0xFFFF;
+    for (size_t index = 0; index < length; ++index) {
+        crc ^= data[index];
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc & 1) != 0 ? static_cast<uint16_t>((crc >> 1) ^ 0xA001)
+                                 : static_cast<uint16_t>(crc >> 1);
+        }
+    }
+    return crc;
+}
+}
+
+void BleOtaServer::resetCommandFrame() {
+    command_frame_ = CommandFrameAssembly{};
+}
+
+bool BleOtaServer::processCommandFrame(const uint8_t* data, size_t length) {
+    const uint32_t now_ms = static_cast<uint32_t>(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    if (command_frame_.active && now_ms - command_frame_.updated_at_ms >= 5000) {
+        ESP_LOGW(TAG, "Command frame assembly expired: id=%u received=%u/%u",
+                 command_frame_.message_id, command_frame_.next_chunk,
+                 command_frame_.total_chunks);
+        resetCommandFrame();
+    }
+    if (data == nullptr || length < kCommandFrameHeaderLength ||
+        data[0] != kCommandFrameMagic || data[1] != kCommandFrameVersion) {
+        ESP_LOGW(TAG, "Invalid command frame header: bytes=%u magic=0x%02X version=%u",
+                 static_cast<unsigned>(length), data != nullptr && length > 0 ? data[0] : 0,
+                 data != nullptr && length > 1 ? data[1] : 0);
+        resetCommandFrame();
+        return false;
+    }
+
+    const uint16_t message_id = readLittleEndian16(data + 2);
+    const uint16_t index = readLittleEndian16(data + 4);
+    const uint16_t total_chunks = readLittleEndian16(data + 6);
+    const uint16_t message_length = readLittleEndian16(data + 8);
+    const uint16_t checksum = readLittleEndian16(data + 10);
+    const size_t payload_length = length - kCommandFrameHeaderLength;
+    if (total_chunks == 0 || index >= total_chunks || message_length == 0 ||
+        message_length > kMaxFramedControlJson || payload_length == 0 ||
+        payload_length > message_length) {
+        ESP_LOGW(TAG, "Invalid command frame metadata: id=%u index=%u/%u messageBytes=%u payloadBytes=%u",
+                 message_id, index, total_chunks, message_length,
+                 static_cast<unsigned>(payload_length));
+        resetCommandFrame();
+        return false;
+    }
+
+    if (!command_frame_.active) {
+        if (index != 0) {
+            ESP_LOGW(TAG, "Command frame started out of order: id=%u index=%u", message_id, index);
+            return false;
+        }
+        command_frame_.active = true;
+        command_frame_.message_id = message_id;
+        command_frame_.message_length = message_length;
+        command_frame_.total_chunks = total_chunks;
+        command_frame_.checksum = checksum;
+        command_frame_.data.reserve(message_length);
+    } else if (command_frame_.message_id != message_id ||
+               command_frame_.message_length != message_length ||
+               command_frame_.total_chunks != total_chunks ||
+               command_frame_.checksum != checksum) {
+        ESP_LOGW(TAG, "Command frame metadata changed mid-message: activeId=%u receivedId=%u",
+                 command_frame_.message_id, message_id);
+        resetCommandFrame();
+        return false;
+    }
+
+    if (index != command_frame_.next_chunk ||
+        command_frame_.data.size() + payload_length > message_length) {
+        ESP_LOGW(TAG, "Command frame out of order or too large: id=%u index=%u expected=%u assembled=%u payload=%u",
+                 message_id, index, command_frame_.next_chunk,
+                 static_cast<unsigned>(command_frame_.data.size()),
+                 static_cast<unsigned>(payload_length));
+        resetCommandFrame();
+        return false;
+    }
+
+    command_frame_.data.append(reinterpret_cast<const char*>(data + kCommandFrameHeaderLength), payload_length);
+    command_frame_.next_chunk++;
+    command_frame_.updated_at_ms = now_ms;
+    if (index == 0 || index + 1 == total_chunks) {
+        ESP_LOGI(TAG, "Command frame received: id=%u frame=%u/%u bytes=%u assembled=%u/%u",
+                 message_id, index + 1, total_chunks, static_cast<unsigned>(length),
+                 static_cast<unsigned>(command_frame_.data.size()), message_length);
+    }
+    if (command_frame_.next_chunk < command_frame_.total_chunks) {
+        return true;
+    }
+
+    const auto* assembled = reinterpret_cast<const uint8_t*>(command_frame_.data.data());
+    const uint16_t actual_checksum = crc16Bytes(assembled, command_frame_.data.size());
+    if (command_frame_.data.size() != command_frame_.message_length ||
+        actual_checksum != command_frame_.checksum) {
+        ESP_LOGW(TAG, "Command frame checksum/length failed: id=%u assembled=%u expected=%u crc=%04X expected=%04X",
+                 message_id, static_cast<unsigned>(command_frame_.data.size()),
+                 command_frame_.message_length, actual_checksum, command_frame_.checksum);
+        resetCommandFrame();
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Command frame reassembled: id=%u chunks=%u bytes=%u crc=%04X",
+             message_id, command_frame_.total_chunks,
+             static_cast<unsigned>(command_frame_.data.size()), command_frame_.checksum);
+    const int result = handleCompleteControlWrite(command_frame_.data.c_str(), command_frame_.data.size());
+    resetCommandFrame();
+    return result == 0;
+}
+
+int BleOtaServer::handleDataWrite(struct ble_gatt_access_ctxt* ctxt) {
+    const uint16_t length = OS_MBUF_PKTLEN(ctxt->om);
+    if (length == 0) {
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+
+    // Process the complete ATT write in bounded pieces. The protocol does not
+    // assume a 20-byte payload; negotiated MTU and write-without-response size
+    // determine the packet size on each connection.
+    uint8_t copy_buffer[kCopyChunkSize];
+    uint16_t offset = 0;
+    while (offset < length) {
+        const uint16_t chunk_length = std::min<uint16_t>(kCopyChunkSize, length - offset);
+        if (os_mbuf_copydata(ctxt->om, offset, chunk_length, copy_buffer) != 0) {
+            ota_manager_.abort("could not read BLE data buffer");
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        if (!ota_manager_.writeData(copy_buffer, chunk_length)) {
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        offset += chunk_length;
+    }
+    return 0;
+}
+
+int BleOtaServer::handleWrite(uint16_t conn_handle, uint16_t attr_handle,
+                              struct ble_gatt_access_ctxt* ctxt) {
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    if (attr_handle == control_handle) {
+        return handleControlWrite(ctxt);
+    }
+    if (attr_handle == data_handle) {
+        return handleDataWrite(ctxt);
+    }
+    return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+}
+
+int BleOtaServer::gattAccessCallback(uint16_t conn_handle, uint16_t attr_handle,
+                                     struct ble_gatt_access_ctxt* ctxt, void*) {
+    if (instance_ == nullptr || ctxt == nullptr) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        return instance_->handleRead(attr_handle, ctxt);
+    }
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        return instance_->handleWrite(conn_handle, attr_handle, ctxt);
+    }
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+void BleOtaServer::gattRegisterCallback(struct ble_gatt_register_ctxt* ctxt, void*) {
+    if (ctxt == nullptr) {
+        return;
+    }
+    char uuid_string[BLE_UUID_STR_LEN]{};
+    if (ctxt->op == BLE_GATT_REGISTER_OP_SVC) {
+        ESP_LOGI(TAG, "registered service %s handle=%d",
+                 ble_uuid_to_str(ctxt->svc.svc_def->uuid, uuid_string), ctxt->svc.handle);
+    } else if (ctxt->op == BLE_GATT_REGISTER_OP_CHR) {
+        ESP_LOGI(TAG, "registered characteristic %s value_handle=%d",
+                 ble_uuid_to_str(ctxt->chr.chr_def->uuid, uuid_string), ctxt->chr.val_handle);
+    }
+}
+
+void BleOtaServer::onBleReset(int reason) {
+    ESP_LOGE(TAG, "NimBLE host reset; reason=%d", reason);
+}
+
+void BleOtaServer::onBleSync() {
+    if (instance_ != nullptr) {
+        instance_->advertise();
+    }
+}
+
+void BleOtaServer::advertise() {
+    uint8_t own_address_type = BLE_OWN_ADDR_PUBLIC;
+    int rc = ble_hs_id_infer_auto(0, &own_address_type);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Could not infer BLE address type: %d", rc);
+        return;
+    }
+
+    struct ble_hs_adv_fields fields{};
+    fields.name = reinterpret_cast<uint8_t*>(const_cast<char*>(kDeviceName));
+    fields.name_len = std::strlen(kDeviceName);
+    fields.name_is_complete = 1;
+    fields.uuids128 = const_cast<ble_uuid128_t*>(&kServiceUuid);
+    fields.num_uuids128 = 1;
+    fields.uuids128_is_complete = 1;
+    rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Could not set advertisement fields: %d", rc);
+        return;
+    }
+
+    struct ble_gap_adv_params params{};
+    params.conn_mode = BLE_GAP_CONN_MODE_UND;
+    params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    rc = ble_gap_adv_start(own_address_type, nullptr, BLE_HS_FOREVER, &params, gapEvent, nullptr);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Could not start BLE advertising: %d", rc);
+        return;
+    }
+    ESP_LOGI(TAG, "BLE advertising as %s", kDeviceName);
+}
+
+int BleOtaServer::gapEvent(struct ble_gap_event* event, void*) {
+    if (instance_ == nullptr || event == nullptr) {
+        return 0;
+    }
+    switch (event->type) {
+        case BLE_GAP_EVENT_CONNECT:
+            if (event->connect.status == 0) {
+                instance_->connection_handle_ = event->connect.conn_handle;
+                instance_->status_notifications_enabled_ = false;
+                // Telemetry is scoped to a BLE session. Reset it even if the
+                // previous client was terminated without a clean disconnect
+                // callback reaching the controller.
+                instance_->resetCommandFrame();
+                instance_->module_manager_.stopTelemetry();
+                ESP_LOGI(TAG, "BLE client connected: handle=%d", event->connect.conn_handle);
+            } else {
+                ESP_LOGW(TAG, "BLE connection failed: status=%d", event->connect.status);
+                instance_->advertise();
+            }
+            break;
+        case BLE_GAP_EVENT_DISCONNECT:
+            ESP_LOGI(TAG, "BLE client disconnected: reason=%d", event->disconnect.reason);
+            instance_->handleDisconnect();
+            instance_->advertise();
+            break;
+        case BLE_GAP_EVENT_ADV_COMPLETE:
+            instance_->advertise();
+            break;
+        case BLE_GAP_EVENT_SUBSCRIBE:
+            if (event->subscribe.attr_handle == status_handle) {
+                instance_->status_notifications_enabled_ = event->subscribe.cur_notify != 0;
+                ESP_LOGI(TAG, "Status notifications %s",
+                         instance_->status_notifications_enabled_ ? "enabled" : "disabled");
+                if (instance_->status_notifications_enabled_) {
+                    instance_->notifyStatus(instance_->last_status_);
+                }
+            }
+            break;
+        default:
+            break;
+    }
+    return 0;
+}
+
+void BleOtaServer::scheduleRestart() {
+    if (restart_pending_) {
+        return;
+    }
+    restart_pending_ = true;
+    if (xTaskCreate(restartTask, "ota_restart", 2048, this, 5, nullptr) != pdPASS) {
+        restart_pending_ = false;
+        ESP_LOGE(TAG, "Could not schedule OTA reboot");
+    }
+}
+
+void BleOtaServer::restartTask(void* argument) {
+    auto* server = static_cast<BleOtaServer*>(argument);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_LOGI(TAG, "Rebooting into verified OTA image");
+    esp_restart();
+    vTaskDelete(nullptr);
+    (void)server;
+}

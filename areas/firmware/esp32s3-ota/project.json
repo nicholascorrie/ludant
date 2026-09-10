@@ -1,0 +1,44 @@
+{
+  "$schema": "../../../node_modules/nx/schemas/project-schema.json",
+  "name": "esp32s3-ota-firmware",
+  "projectType": "application",
+  "sourceRoot": "areas/firmware/esp32s3-ota/main",
+  "targets": {
+    "set-target": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "idf.py set-target esp32s3",
+        "cwd": "{projectRoot}"
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "idf.py build",
+        "cwd": "{projectRoot}"
+      }
+    },
+    "flash": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "idf.py flash",
+        "cwd": "{projectRoot}"
+      }
+    },
+    "monitor": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "idf.py monitor",
+        "cwd": "{projectRoot}"
+      }
+    },
+    "flash-monitor": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "idf.py flash monitor",
+        "cwd": "{projectRoot}"
+      }
+    }
+  },
+  "tags": ["scope:firmware", "platform:esp32s3"]
+}

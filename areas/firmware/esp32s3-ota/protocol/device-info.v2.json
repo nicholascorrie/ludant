@@ -1,0 +1,16 @@
+{
+  "device": "electronics-controller",
+  "deviceId": "esp32s3-example",
+  "friendlyName": "Ludant controller",
+  "firmware": "arduino-modules-1.0.4",
+  "chip": "ESP32-S3",
+  "otaProtocol": 1,
+  "protocolVersion": 2,
+  "supportsModules": true,
+  "capabilities": [
+    { "driverId": "mpu6050", "version": "1.0.0" },
+    { "driverId": "bme280", "version": "1.0.0" },
+    { "driverId": "soil-moisture", "version": "1.0.0" },
+    { "driverId": "relay", "version": "1.0.0" }
+  ]
+}

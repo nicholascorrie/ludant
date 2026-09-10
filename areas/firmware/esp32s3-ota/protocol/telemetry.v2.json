@@ -1,0 +1,13 @@
+{
+  "type": "telemetry",
+  "protocolVersion": 2,
+  "sequence": 42,
+  "uptimeMs": 123456,
+  "deviceId": "esp32s3-example",
+  "instanceId": "motion-1",
+  "quality": "ok",
+  "error": null,
+  "values": {
+    "accelX": 0.02
+  }
+}
