@@ -12,6 +12,25 @@ config LUDANT_OTA_WINDOW_SECONDS
     range 1 3600
     default 120
 
+config LUDANT_OTA_DEVELOPMENT_WINDOW
+    bool "Allow timed OTA window (development only)"
+    default n
+    help
+        When enabled, OTA is allowed during the configured boot window. Keep
+        this disabled for production builds, which require the physical BOOT
+        button confirmation.
+
+config LUDANT_BOOT_VERSION
+    string "Boot/runtime compatibility version"
+    default "1.0.0"
+
+config LUDANT_OTA_PUBLIC_KEY_DER_HEX
+    string "Ed25519 public key DER encoded as hexadecimal"
+    default ""
+    help
+        Release builds must inject the public key matching the private signing
+        key. An empty key fails closed and rejects all OTA requests.
+
 config LUDANT_BOOT_BUTTON_GPIO
     int "BOOT button GPIO"
     range 0 48

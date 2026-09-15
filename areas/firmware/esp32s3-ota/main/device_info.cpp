@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "esp_app_desc.h"
+#include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "nvs.h"
 
@@ -11,6 +12,26 @@ namespace {
 constexpr char kNamespace[] = "ludant";
 constexpr char kDeviceIdKey[] = "device_id";
 constexpr char kNameKey[] = "friendly_name";
+
+std::string escapeJson(const char* value) {
+    std::string escaped;
+    if (value == nullptr) return escaped;
+    for (const unsigned char character : std::string(value)) {
+        switch (character) {
+            case '\\': escaped += "\\\\"; break;
+            case '\"': escaped += "\\\""; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                if (character < 0x20) escaped += '?';
+                else escaped += static_cast<char>(character);
+        }
+    }
+    return escaped;
+}
 }
 
 bool DeviceInfo::begin() {
@@ -47,12 +68,29 @@ const char* DeviceInfo::firmwareVersion() const {
     return description != nullptr && description->version[0] != '\0' ? description->version : CONFIG_LUDANT_FIRMWARE_VERSION;
 }
 
+const char* DeviceInfo::bootVersion() const {
+#ifdef CONFIG_LUDANT_BOOT_VERSION
+    return CONFIG_LUDANT_BOOT_VERSION;
+#else
+    return "1.0.0";
+#endif
+}
+
+uint32_t DeviceInfo::otaMaxImageSize() const {
+    const esp_partition_t* partition = esp_ota_get_next_update_partition(nullptr);
+    return partition == nullptr ? 0 : partition->size;
+}
+
 std::string DeviceInfo::json() const {
-    char buffer[256]{};
-    std::snprintf(
-        buffer,
-        sizeof(buffer),
-        "{\"device\":\"electronics-controller\",\"chip\":\"ESP32-S3\",\"firmware\":\"%s\",\"otaProtocol\":1,\"supportsModules\":true,\"deviceId\":\"%s\",\"friendlyName\":\"%s\"}",
-        firmwareVersion(), device_id_.c_str(), friendly_name_.c_str());
-    return buffer;
+    const char* ota_authorization = "physical_button";
+#if CONFIG_LUDANT_OTA_DEVELOPMENT_WINDOW
+    ota_authorization = "physical_button_or_timed_window";
+#endif
+    return std::string("{\"device\":\"electronics-controller\",\"chip\":\"ESP32-S3\",\"hardware\":\"ESP32-S3\",\"firmware\":\"") +
+        escapeJson(firmwareVersion()) +
+        "\",\"otaProtocol\":2,\"protocolVersion\":2,\"supportsOTA\":true,\"otaCapabilities\":[\"signed\",\"sha256\",\"rollback\",\"sequential_write_with_response\",\"sequential_write_without_response\"],\"supportsModules\":true,\"otaAuthorization\":\"" + ota_authorization + "\",\"bootVersion\":\"" +
+        escapeJson(bootVersion()) +
+        "\",\"otaMaxImageSize\":" + std::to_string(otaMaxImageSize()) +
+        ",\"deviceId\":\"" + escapeJson(device_id_.c_str()) +
+        "\",\"friendlyName\":\"" + escapeJson(friendly_name_.c_str()) + "\"}";
 }

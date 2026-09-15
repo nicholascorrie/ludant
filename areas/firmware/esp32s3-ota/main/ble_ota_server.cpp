@@ -27,10 +27,14 @@ constexpr char TAG[] = "ble_ota";
 constexpr char kDeviceName[] = "Ludant";
 constexpr size_t kMaxControlJson = 8192;
 constexpr size_t kMaxFramedControlJson = 2047;
-constexpr size_t kCopyChunkSize = 1024;
+// Keep the server-side copy bounded to the same size accepted by the OTA
+// manager's queue. This prevents a large ATT write from being split into a
+// callback-sized buffer that the manager would reject.
+constexpr size_t kCopyChunkSize = 512;
 constexpr uint8_t kCommandFrameMagic = 0xC2;
 constexpr uint8_t kCommandFrameVersion = 1;
 constexpr size_t kCommandFrameHeaderLength = 12;
+constexpr size_t kBinaryTelemetryMaxPayload = ludant::kBinaryTelemetryMaxPayloadLength;
 
 // NimBLE's BLE_UUID128_INIT takes the UUID bytes in little-endian order.
 // These bytes render as 7A910000-4C5E-4A9B-8F23-91F4A7D10000.
@@ -49,11 +53,15 @@ static const ble_uuid128_t kStatusUuid = BLE_UUID128_INIT(
 static const ble_uuid128_t kDeviceInfoUuid = BLE_UUID128_INIT(
     0x00, 0x00, 0xd1, 0xa7, 0xf4, 0x91, 0x23, 0x8f,
     0x9b, 0x4a, 0x5e, 0x4c, 0x04, 0x00, 0x91, 0x7a);
+static const ble_uuid128_t kTelemetryUuid = BLE_UUID128_INIT(
+    0x00, 0x00, 0xd1, 0xa7, 0xf4, 0x91, 0x23, 0x8f,
+    0x9b, 0x4a, 0x5e, 0x4c, 0x05, 0x00, 0x91, 0x7a);
 
 static uint16_t control_handle = 0;
 static uint16_t data_handle = 0;
 static uint16_t status_handle = 0;
 static uint16_t device_info_handle = 0;
+static uint16_t telemetry_handle = 0;
 
 static int accessCallback(uint16_t conn_handle, uint16_t attr_handle,
                           struct ble_gatt_access_ctxt* ctxt, void* arg) {
@@ -89,6 +97,12 @@ static const struct ble_gatt_svc_def services[] = {
                 .flags = BLE_GATT_CHR_F_READ,
                 .val_handle = &device_info_handle,
             },
+            {
+                .uuid = &kTelemetryUuid.u,
+                .access_cb = accessCallback,
+                .flags = BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &telemetry_handle,
+            },
             { 0 },
         },
     },
@@ -103,9 +117,22 @@ BleOtaServer::BleOtaServer(OtaManager& ota_manager, const DeviceInfo& device_inf
     instance_ = this;
     ota_manager_.setStatusCallback(statusCallback, this);
     module_manager_.setOutputCallback(moduleCallback, this);
+    module_manager_.setTelemetryCallback(telemetryCallback, this);
 }
 
 esp_err_t BleOtaServer::start() {
+    if (!ota_manager_.startDataWorker()) {
+        ESP_LOGE(TAG, "Could not start OTA data worker");
+        return ESP_ERR_NO_MEM;
+    }
+    advertising_ready_ = xSemaphoreCreateBinary();
+    if (advertising_ready_ == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    telemetry_queue_ = xQueueCreate(16, sizeof(ludant::BinaryTelemetryPacket));
+    if (telemetry_queue_ == nullptr || xTaskCreate(telemetryTask, "ludant_binary_telemetry", 3072, this, 4, &telemetry_task_) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
     const esp_err_t nimble_err = nimble_port_init();
     if (nimble_err != ESP_OK) {
         ESP_LOGE(TAG, "NimBLE initialization failed: %s", esp_err_to_name(nimble_err));
@@ -134,6 +161,10 @@ esp_err_t BleOtaServer::start() {
 
     ble_store_config_init();
     nimble_port_freertos_init([](void*) { nimble_port_run(); });
+    if (xSemaphoreTake(advertising_ready_, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGE(TAG, "BLE advertising did not become ready");
+        return ESP_ERR_TIMEOUT;
+    }
     return ESP_OK;
 }
 
@@ -143,6 +174,69 @@ void BleOtaServer::statusCallback(const char* message, void* context) {
 
 void BleOtaServer::moduleCallback(const char* message, void* context) {
     static_cast<BleOtaServer*>(context)->handleStatus(message);
+}
+
+void BleOtaServer::telemetryCallback(const ludant::BinaryTelemetryPacket& packet, void* context) {
+    static_cast<BleOtaServer*>(context)->notifyTelemetry(packet);
+}
+
+void BleOtaServer::telemetryTask(void* argument) {
+    auto* server = static_cast<BleOtaServer*>(argument);
+    ludant::BinaryTelemetryPacket packet{};
+    while (true) {
+        if (server->telemetry_queue_ == nullptr ||
+            xQueueReceive(server->telemetry_queue_, &packet, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (!server->telemetry_notifications_enabled_ ||
+            server->connection_handle_ == BLE_HS_CONN_HANDLE_NONE) {
+            continue;
+        }
+        uint8_t payload[kBinaryTelemetryMaxPayload]{};
+        const size_t payload_length = ludant::encodeBinaryTelemetryPayload(packet, payload, sizeof(payload));
+        if (payload_length == 0 || payload_length > UINT16_MAX) {
+            ESP_LOGW(TAG, "Could not encode binary telemetry packet: fields=%u", packet.field_count);
+            continue;
+        }
+        size_t offset = 0;
+        bool first = true;
+        while (offset < payload_length) {
+            uint8_t frame[ludant::kBinaryTelemetryFrameLength]{};
+            const size_t header_length = first ? 11 : 7;
+            const size_t chunk_length = std::min(ludant::kBinaryTelemetryFrameLength - header_length,
+                                                payload_length - offset);
+            frame[0] = ludant::kBinaryTelemetryFrameMagic;
+            frame[1] = ludant::kBinaryTelemetryVersion;
+            frame[2] = (first ? ludant::kBinaryTelemetryFrameStart : 0) |
+                       (offset + chunk_length == payload_length ? ludant::kBinaryTelemetryFrameEnd : 0);
+            frame[3] = static_cast<uint8_t>(packet.sequence & 0xFF);
+            frame[4] = static_cast<uint8_t>(packet.sequence >> 8);
+            if (first) {
+                frame[5] = static_cast<uint8_t>(packet.uptime_ms & 0xFF);
+                frame[6] = static_cast<uint8_t>((packet.uptime_ms >> 8) & 0xFF);
+                frame[7] = static_cast<uint8_t>((packet.uptime_ms >> 16) & 0xFF);
+                frame[8] = static_cast<uint8_t>((packet.uptime_ms >> 24) & 0xFF);
+                frame[9] = static_cast<uint8_t>(payload_length & 0xFF);
+                frame[10] = static_cast<uint8_t>(payload_length >> 8);
+            } else {
+                frame[5] = static_cast<uint8_t>(offset & 0xFF);
+                frame[6] = static_cast<uint8_t>(offset >> 8);
+            }
+            std::memcpy(frame + header_length, payload + offset, chunk_length);
+            struct os_mbuf* buffer = ble_hs_mbuf_from_flat(frame, header_length + chunk_length);
+            if (buffer == nullptr) {
+                ESP_LOGW(TAG, "Could not allocate binary telemetry notification buffer");
+                break;
+            }
+            const int rc = ble_gatts_notify_custom(server->connection_handle_, telemetry_handle, buffer);
+            if (rc != 0) {
+                ESP_LOGW(TAG, "Binary telemetry notification failed: %d", rc);
+                break;
+            }
+            offset += chunk_length;
+            first = false;
+        }
+    }
 }
 
 void BleOtaServer::handleStatus(const char* message) {
@@ -174,9 +268,19 @@ void BleOtaServer::notifyStatus(const char* message) {
     }
 }
 
+void BleOtaServer::notifyTelemetry(const ludant::BinaryTelemetryPacket& packet) {
+    if (telemetry_queue_ == nullptr) return;
+    if (xQueueSend(telemetry_queue_, &packet, 0) == pdTRUE) return;
+    ludant::BinaryTelemetryPacket discarded{};
+    xQueueReceive(telemetry_queue_, &discarded, 0);
+    xQueueSend(telemetry_queue_, &packet, 0);
+}
+
 void BleOtaServer::handleDisconnect() {
     status_notifications_enabled_ = false;
+    telemetry_notifications_enabled_ = false;
     connection_handle_ = BLE_HS_CONN_HANDLE_NONE;
+    if (telemetry_queue_ != nullptr) xQueueReset(telemetry_queue_);
     ota_manager_.onDisconnect();
     module_manager_.stopTelemetry();
 }
@@ -242,17 +346,37 @@ int BleOtaServer::handleCompleteControlWrite(const char* message, size_t length)
     }
 
     bool accepted = false;
-    if (std::strcmp(command_item->valuestring, "begin") == 0) {
+    if (std::strcmp(command_item->valuestring, "ota_authorization_status") == 0) {
+        if (ota_manager_.isActive()) {
+            handleStatus("ERROR:OTA_BUSY:controller commands are disabled during firmware update");
+            accepted = false;
+        } else {
+            handleStatus(ota_manager_.authorizationAllowed() ? "AUTHORIZATION_READY" : "WAITING_FOR_BOOT");
+            accepted = true;
+        }
+    } else if (std::strcmp(command_item->valuestring, "begin") == 0) {
         const cJSON* size_item = cJSON_GetObjectItemCaseSensitive(root, "size");
         const cJSON* sha_item = cJSON_GetObjectItemCaseSensitive(root, "sha256");
         const cJSON* version_item = cJSON_GetObjectItemCaseSensitive(root, "version");
+        const cJSON* product_item = cJSON_GetObjectItemCaseSensitive(root, "product");
+        const cJSON* hardware_item = cJSON_GetObjectItemCaseSensitive(root, "hardware");
+        const cJSON* ota_protocol_item = cJSON_GetObjectItemCaseSensitive(root, "otaProtocol");
+        const cJSON* signature_item = cJSON_GetObjectItemCaseSensitive(root, "signature");
+        const cJSON* algorithm_item = signature_item == nullptr ? nullptr : cJSON_GetObjectItemCaseSensitive(signature_item, "algorithm");
+        const cJSON* value_item = signature_item == nullptr ? nullptr : cJSON_GetObjectItemCaseSensitive(signature_item, "value");
         if (cJSON_IsNumber(size_item) && cJSON_IsString(sha_item) && cJSON_IsString(version_item) &&
+            cJSON_IsString(product_item) && cJSON_IsString(hardware_item) && cJSON_IsNumber(ota_protocol_item) &&
+            cJSON_IsString(algorithm_item) && cJSON_IsString(value_item) &&
             size_item->valuedouble >= 1.0 && size_item->valuedouble <= 4294967295.0 &&
             size_item->valuedouble == static_cast<double>(static_cast<uint32_t>(size_item->valuedouble))) {
             accepted = ota_manager_.begin(
                 static_cast<uint32_t>(size_item->valuedouble),
                 sha_item->valuestring,
-                version_item->valuestring);
+                version_item->valuestring,
+                product_item->valuestring,
+                hardware_item->valuestring,
+                static_cast<uint8_t>(ota_protocol_item->valuedouble),
+                std::strcmp(algorithm_item->valuestring, "ed25519") == 0 ? value_item->valuestring : "");
         } else {
             handleStatus("ERROR:INVALID_BEGIN:begin requires integer size, sha256, and version");
         }
@@ -262,7 +386,12 @@ int BleOtaServer::handleCompleteControlWrite(const char* message, size_t length)
         ota_manager_.abort("client requested abort");
         accepted = true;
     } else {
-        accepted = module_manager_.handleCommand(message, length);
+        if (ota_manager_.isActive()) {
+            handleStatus("ERROR:OTA_BUSY:controller commands are disabled during firmware update");
+            accepted = false;
+        } else {
+            accepted = module_manager_.handleCommand(message, length);
+        }
     }
 
     cJSON_Delete(root);
@@ -393,9 +522,8 @@ int BleOtaServer::handleDataWrite(struct ble_gatt_access_ctxt* ctxt) {
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
 
-    // Process the complete ATT write in bounded pieces. The protocol does not
-    // assume a 20-byte payload; negotiated MTU and write-without-response size
-    // determine the packet size on each connection.
+    // Copy the complete ATT write in bounded pieces. Flash writes run on the
+    // OTA worker so this NimBLE callback remains responsive to acknowledgements.
     uint8_t copy_buffer[kCopyChunkSize];
     uint16_t offset = 0;
     while (offset < length) {
@@ -404,7 +532,7 @@ int BleOtaServer::handleDataWrite(struct ble_gatt_access_ctxt* ctxt) {
             ota_manager_.abort("could not read BLE data buffer");
             return BLE_ATT_ERR_UNLIKELY;
         }
-        if (!ota_manager_.writeData(copy_buffer, chunk_length)) {
+        if (!ota_manager_.enqueueData(copy_buffer, chunk_length)) {
             return BLE_ATT_ERR_UNLIKELY;
         }
         offset += chunk_length;
@@ -414,7 +542,9 @@ int BleOtaServer::handleDataWrite(struct ble_gatt_access_ctxt* ctxt) {
 
 int BleOtaServer::handleWrite(uint16_t conn_handle, uint16_t attr_handle,
                               struct ble_gatt_access_ctxt* ctxt) {
-    if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE || conn_handle != connection_handle_) {
+        ESP_LOGW(TAG, "Rejected write from inactive BLE connection: received=%u active=%u",
+                 conn_handle, connection_handle_);
         return BLE_ATT_ERR_UNLIKELY;
     }
     if (attr_handle == control_handle) {
@@ -460,16 +590,18 @@ void BleOtaServer::onBleReset(int reason) {
 
 void BleOtaServer::onBleSync() {
     if (instance_ != nullptr) {
-        instance_->advertise();
+        if (instance_->advertise() && instance_->advertising_ready_ != nullptr) {
+            xSemaphoreGive(instance_->advertising_ready_);
+        }
     }
 }
 
-void BleOtaServer::advertise() {
+bool BleOtaServer::advertise() {
     uint8_t own_address_type = BLE_OWN_ADDR_PUBLIC;
     int rc = ble_hs_id_infer_auto(0, &own_address_type);
     if (rc != 0) {
         ESP_LOGE(TAG, "Could not infer BLE address type: %d", rc);
-        return;
+        return false;
     }
 
     struct ble_hs_adv_fields fields{};
@@ -482,7 +614,7 @@ void BleOtaServer::advertise() {
     rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
         ESP_LOGE(TAG, "Could not set advertisement fields: %d", rc);
-        return;
+        return false;
     }
 
     struct ble_gap_adv_params params{};
@@ -491,9 +623,10 @@ void BleOtaServer::advertise() {
     rc = ble_gap_adv_start(own_address_type, nullptr, BLE_HS_FOREVER, &params, gapEvent, nullptr);
     if (rc != 0) {
         ESP_LOGE(TAG, "Could not start BLE advertising: %d", rc);
-        return;
+        return false;
     }
     ESP_LOGI(TAG, "BLE advertising as %s", kDeviceName);
+    return true;
 }
 
 int BleOtaServer::gapEvent(struct ble_gap_event* event, void*) {
@@ -505,6 +638,7 @@ int BleOtaServer::gapEvent(struct ble_gap_event* event, void*) {
             if (event->connect.status == 0) {
                 instance_->connection_handle_ = event->connect.conn_handle;
                 instance_->status_notifications_enabled_ = false;
+                instance_->telemetry_notifications_enabled_ = false;
                 // Telemetry is scoped to a BLE session. Reset it even if the
                 // previous client was terminated without a clean disconnect
                 // callback reaching the controller.
@@ -532,6 +666,10 @@ int BleOtaServer::gapEvent(struct ble_gap_event* event, void*) {
                 if (instance_->status_notifications_enabled_) {
                     instance_->notifyStatus(instance_->last_status_);
                 }
+            } else if (event->subscribe.attr_handle == telemetry_handle) {
+                instance_->telemetry_notifications_enabled_ = event->subscribe.cur_notify != 0;
+                ESP_LOGI(TAG, "Binary telemetry notifications %s",
+                         instance_->telemetry_notifications_enabled_ ? "enabled" : "disabled");
             }
             break;
         default:

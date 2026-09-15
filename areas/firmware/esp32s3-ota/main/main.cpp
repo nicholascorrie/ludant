@@ -36,9 +36,8 @@ void confirmRunningApplication() {
 }
 
 extern "C" void app_main() {
-    ESP_LOGI(TAG, "Ludant ESP32-S3 firmware starting");
+    ESP_LOGI(TAG, "Ludant ESP32-S3 firmware starting; resetReason=%d", static_cast<int>(esp_reset_reason()));
     initializeNvs();
-    confirmRunningApplication();
 
     OtaPermission permission;
     ESP_ERROR_CHECK(permission.begin());
@@ -47,9 +46,13 @@ extern "C" void app_main() {
     ESP_ERROR_CHECK(device_info.begin() ? ESP_OK : ESP_FAIL);
     ModuleManager module_manager(device_info);
     ESP_ERROR_CHECK(module_manager.begin() ? ESP_OK : ESP_FAIL);
-    OtaManager ota_manager(permission);
+    OtaManager ota_manager(permission, device_info);
     BleOtaServer ble_server(ota_manager, device_info, module_manager);
     ESP_ERROR_CHECK(ble_server.start());
+    // The image is confirmed only after the controller, GATT database, and
+    // advertising path have initialized successfully. If any of those fail,
+    // the bootloader can roll back the pending image.
+    confirmRunningApplication();
 
     ESP_LOGI(TAG, "Firmware ready; normal application logic can be added alongside the OTA layer");
 }

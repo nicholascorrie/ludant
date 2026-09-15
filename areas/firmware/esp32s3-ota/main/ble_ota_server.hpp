@@ -5,6 +5,9 @@
 #include <string>
 
 #include "device_info.hpp"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 #include "host/ble_hs.h"
 #include "ota_manager.hpp"
 #include "module_manager.hpp"
@@ -24,6 +27,8 @@ public:
 private:
     static void statusCallback(const char* message, void* context);
     static void moduleCallback(const char* message, void* context);
+    static void telemetryCallback(const ludant::BinaryTelemetryPacket& packet, void* context);
+    static void telemetryTask(void* argument);
     static void gattRegisterCallback(struct ble_gatt_register_ctxt* ctxt, void* arg);
     static void onBleReset(int reason);
     static void onBleSync();
@@ -37,8 +42,9 @@ private:
     int handleDataWrite(struct ble_gatt_access_ctxt* ctxt);
     bool processCommandFrame(const uint8_t* data, size_t length);
     void resetCommandFrame();
-    void advertise();
+    bool advertise();
     void notifyStatus(const char* message);
+    void notifyTelemetry(const ludant::BinaryTelemetryPacket& packet);
     void scheduleRestart();
 
     OtaManager& ota_manager_;
@@ -46,8 +52,12 @@ private:
     ModuleManager& module_manager_;
     uint16_t connection_handle_{BLE_HS_CONN_HANDLE_NONE};
     bool status_notifications_enabled_{false};
+    bool telemetry_notifications_enabled_{false};
     bool restart_pending_{false};
+    SemaphoreHandle_t advertising_ready_{nullptr};
     char last_status_[160]{"IDLE"};
+    QueueHandle_t telemetry_queue_{nullptr};
+    TaskHandle_t telemetry_task_{nullptr};
 
     struct CommandFrameAssembly {
         std::string data;

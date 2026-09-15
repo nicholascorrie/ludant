@@ -1,8 +1,8 @@
 {
-  "additionalFiles": "",
+  "additionalFiles": "../..,../..",
   "compiler.optimization_flags": "-Os",
   "customBuildProperties": "",
-  "fqbn": "esp32:esp32:esp32s3",
+  "fqbn": "esp32:esp32:esp32s3:CDCOnBoot=cdc",
   "hardwareFolders": "/Users/nickcorrie/Library/Arduino15/packages/esp32/hardware/esp32/3.3.11,/Users/nickcorrie/Library/Arduino15/packages/esp32/hardware/esp32/3.3.11",
   "otherLibrariesFolders": "/Users/nickcorrie/Documents/Arduino/libraries",
   "sketchLocation": "/Users/nickcorrie/Desktop/dev/projects/ludant/areas/firmware/esp32s3-ota/arduino/ludant_esp32s3_ota"

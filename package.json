@@ -2,7 +2,9 @@
   "name": "@org/source",
   "version": "0.0.0",
   "license": "MIT",
-  "scripts": {},
+  "scripts": {
+    "firmware:release": "node areas/firmware/esp32s3-ota/tools/release-arduino-firmware.mjs"
+  },
   "private": true,
   "dependencies": {},
   "devDependencies": {

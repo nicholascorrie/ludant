@@ -136,6 +136,11 @@ void ModuleManager::setOutputCallback(ModuleOutputCallback callback, void* conte
     output_context_ = context;
 }
 
+void ModuleManager::setTelemetryCallback(ModuleTelemetryCallback callback, void* context) {
+    telemetry_callback_ = callback;
+    telemetry_context_ = context;
+}
+
 bool ModuleManager::begin() {
     nvs_handle_t handle;
     if (nvs_open(kNvsNamespace, NVS_READONLY, &handle) == ESP_OK) {
@@ -381,6 +386,8 @@ bool ModuleManager::handleCommand(const char* message, size_t length) {
         const char* requested_instance = stringItem(root, "instanceId");
         telemetry_instance_ = requested_instance == nullptr ? "" : requested_instance;
         telemetry_interval_ms_ = std::max<uint32_t>(50, numberItem(root, "intervalMs", kDefaultIntervalMs));
+        const char* transport = stringItem(root, "telemetryTransport");
+        binary_telemetry_enabled_ = transport != nullptr && std::strcmp(transport, "binary-v2") == 0;
         if (!telemetry_running_) { telemetry_running_ = true; xTaskCreate(telemetryTask, "ludant_telemetry", 4096, this, 4, reinterpret_cast<TaskHandle_t*>(&telemetry_task_)); }
         emitResponse(request_id, true, nullptr, nullptr);
     } else if (std::strcmp(command, "stop_telemetry") == 0) {
@@ -392,7 +399,7 @@ bool ModuleManager::handleCommand(const char* message, size_t length) {
     return true;
 }
 
-void ModuleManager::stopTelemetry() { telemetry_running_ = false; telemetry_instance_.clear(); }
+void ModuleManager::stopTelemetry() { telemetry_running_ = false; telemetry_instance_.clear(); binary_telemetry_enabled_ = false; }
 
 void ModuleManager::telemetryTask(void* argument) {
     auto* manager = static_cast<ModuleManager*>(argument);
@@ -404,34 +411,64 @@ void ModuleManager::telemetryTask(void* argument) {
 void ModuleManager::runTelemetry() { emitTelemetry(); }
 
 void ModuleManager::emitTelemetry() {
-    if (output_callback_ == nullptr || telemetry_instance_.empty()) return;
+    if (output_callback_ == nullptr && telemetry_callback_ == nullptr) return;
+    if (telemetry_instance_.empty()) return;
     cJSON* modules = cJSON_Parse(modules_json_.c_str()); cJSON* module = nullptr;
     cJSON_ArrayForEach(module, modules) {
         const char* existing_id = stringItem(module, "instanceId");
         if (existing_id != nullptr && std::strcmp(existing_id, telemetry_instance_.c_str()) == 0) break;
     }
     if (module == nullptr) { cJSON_Delete(modules); return; }
-    cJSON* values = cJSON_CreateObject();
     const char* plugin = stringItem(module, "pluginId");
-    if (std::strcmp(plugin == nullptr ? "" : plugin, "actuator.relay") == 0) cJSON_AddNumberToObject(values, "state", parameterValue(module, "state", 0));
+    const bool use_binary = binary_telemetry_enabled_ && telemetry_callback_ != nullptr;
+    cJSON* values = use_binary ? nullptr : cJSON_CreateObject();
+    ludant::BinaryTelemetryPacket binary_packet{};
+    binary_packet.uptime_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    auto addValue = [&](const char* key, double value) {
+        if (use_binary) {
+            if (binary_packet.field_count >= ludant::kBinaryTelemetryMaxFields) return;
+            auto& field = binary_packet.fields[binary_packet.field_count++];
+            std::strncpy(field.name, key, ludant::kBinaryTelemetryFieldNameLength);
+            field.name[ludant::kBinaryTelemetryFieldNameLength] = '\0';
+            field.value = static_cast<float>(value);
+        } else {
+            cJSON_AddNumberToObject(values, key, value);
+        }
+    };
+    auto setError = [&](const char* message) {
+        if (use_binary && message != nullptr) {
+            std::strncpy(binary_packet.error, message, ludant::kBinaryTelemetryErrorLength);
+            binary_packet.error[ludant::kBinaryTelemetryErrorLength] = '\0';
+        }
+    };
+    if (std::strcmp(plugin == nullptr ? "" : plugin, "actuator.relay") == 0) addValue("state", parameterValue(module, "state", 0));
     else if (std::strcmp(plugin == nullptr ? "" : plugin, "sensor.soil-moisture") == 0) {
         int channel = adcChannelForGpio(pinValue(module, "signal"));
         int raw = channel < 0 ? 0 : adc1_get_raw(static_cast<adc1_channel_t>(channel));
         int dry = parameterValue(module, "dryValue", 3200); int wet = parameterValue(module, "wetValue", 1400);
         double moisture = dry == wet ? 0.0 : std::clamp(100.0 * (dry - raw) / static_cast<double>(dry - wet), 0.0, 100.0);
-        cJSON_AddNumberToObject(values, "moisture", moisture);
+        addValue("moisture", moisture);
     } else if (std::strcmp(plugin == nullptr ? "" : plugin, "sensor.mpu6050") == 0) {
         uint8_t bytes[14]{};
         const int address = parameterValue(module, "address", 0x68);
         if (readI2C(pinValue(module, "sda"), pinValue(module, "scl"), address, 0x3B, bytes, sizeof(bytes))) {
             auto signedValue = [&bytes](size_t index) { return static_cast<int16_t>((static_cast<uint16_t>(bytes[index]) << 8) | bytes[index + 1]); };
-            cJSON_AddNumberToObject(values, "accelX", signedValue(0) / 16384.0);
-            cJSON_AddNumberToObject(values, "accelY", signedValue(2) / 16384.0);
-            cJSON_AddNumberToObject(values, "accelZ", signedValue(4) / 16384.0);
-            cJSON_AddNumberToObject(values, "temperature", signedValue(6) / 340.0 + 36.53);
-            cJSON_AddNumberToObject(values, "gyroX", signedValue(8) / 131.0);
-            cJSON_AddNumberToObject(values, "gyroY", signedValue(10) / 131.0);
-            cJSON_AddNumberToObject(values, "gyroZ", signedValue(12) / 131.0);
+            const double accel_x = signedValue(0) / 16384.0;
+            const double accel_y = signedValue(2) / 16384.0;
+            const double accel_z = signedValue(4) / 16384.0;
+            const double temperature = signedValue(6) / 340.0 + 36.53;
+            const double gyro_x = signedValue(8) / 131.0;
+            const double gyro_y = signedValue(10) / 131.0;
+            const double gyro_z = signedValue(12) / 131.0;
+            addValue("accelX", accel_x);
+            addValue("accelY", accel_y);
+            addValue("accelZ", accel_z);
+            addValue("temperature", temperature);
+            addValue("gyroX", gyro_x);
+            addValue("gyroY", gyro_y);
+            addValue("gyroZ", gyro_z);
+        } else {
+            setError("MPU6050 read failed");
         }
     } else if (std::strcmp(plugin == nullptr ? "" : plugin, "sensor.bme280") == 0) {
         uint8_t bytes[8]{};
@@ -459,11 +496,25 @@ void ModuleManager::emitTelemetry() {
             double pressure_hpa = 0.0;
             if (ludant::compensateBME280(calibration, pressure, temperature, humidity,
                                          temperature_c, humidity_percent, pressure_hpa)) {
-                cJSON_AddNumberToObject(values, "pressure", pressure_hpa);
-                cJSON_AddNumberToObject(values, "temperature", temperature_c);
-                cJSON_AddNumberToObject(values, "humidity", humidity_percent);
+                addValue("pressure", pressure_hpa);
+                addValue("temperature", temperature_c);
+                addValue("humidity", humidity_percent);
+            } else {
+                setError("BME280 compensation failed");
             }
+        } else {
+            setError("BME280 read failed");
         }
+    }
+    if (use_binary) {
+        binary_packet.sequence = static_cast<uint16_t>(telemetry_sequence_++);
+        binary_packet.quality = binary_packet.field_count > 0 && binary_packet.error[0] == '\0' ? 0 : 1;
+        if (binary_packet.quality != 0 && binary_packet.error[0] == '\0') {
+            setError("No telemetry values available");
+        }
+        telemetry_callback_(binary_packet, telemetry_context_);
+        cJSON_Delete(modules);
+        return;
     }
     cJSON* packet = cJSON_CreateObject(); cJSON_AddStringToObject(packet, "type", "telemetry");
     cJSON_AddStringToObject(packet, "deviceId", device_info_.deviceId()); cJSON_AddStringToObject(packet, "instanceId", telemetry_instance_.c_str());

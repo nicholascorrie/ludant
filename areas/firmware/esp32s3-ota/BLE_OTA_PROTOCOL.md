@@ -1,4 +1,4 @@
-# Ludant BLE OTA protocol
+# Ludant BLE OTA protocol v2
 
 ## UUIDs
 
@@ -9,163 +9,219 @@
 | Firmware Data | `7A910002-4C5E-4A9B-8F23-91F4A7D10000` | Write, Write Without Response |
 | Status | `7A910003-4C5E-4A9B-8F23-91F4A7D10000` | Read, Notify |
 | Device Info | `7A910004-4C5E-4A9B-8F23-91F4A7D10000` | Read |
+| Telemetry | `7A910005-4C5E-4A9B-8F23-91F4A7D10000` | Notify |
 
-The device advertises as `Ludant` and exposes the OTA service UUID for discovery.
+The device advertises as `Ludant` and exposes the OTA service UUID.
 
-## Permission window
+## Authorization and authenticity
 
-`begin` is accepted only during the first 120 seconds after boot or while the configured BOOT button is held. This is an MVP authorization gate. It is intentionally structured so a future challenge/response or signed-update policy can be added without changing the data transport.
+Production `begin` requests are accepted only while the configured BOOT button
+is held. Development builds may explicitly enable the timed boot window. The
+policy is reported as `otaAuthorization` in Device Info, and authorization
+failures use `ERROR:WINDOW_CLOSED:<description>`.
+
+The detached Ed25519 signature signs the raw 32-byte SHA-256 digest of
+`firmware.bin`. The public key is compiled into firmware and iOS. An empty or
+invalid key fails closed.
 
 ## Control messages
 
-Control messages are UTF-8 JSON.
+Control messages are UTF-8 JSON. The required begin shape is:
 
-### Begin
+Before `begin`, clients may send:
+
+```json
+{"command":"ota_authorization_status"}
+```
+
+The controller reports `WAITING_FOR_BOOT` until the physical BOOT button is
+held, then reports `AUTHORIZATION_READY`. This is a preflight hint only;
+`begin` re-checks authorization immediately and remains the security boundary.
 
 ```json
 {
-  "command": "begin",
-  "size": 1048576,
-  "sha256": "64 lowercase hex characters",
-  "version": "0.1.1"
+  "command":"begin",
+  "product":"ludant-esp32s3",
+  "hardware":"ESP32-S3",
+  "size":1048576,
+  "sha256":"lowercase-64-character-sha256",
+  "version":"arduino-modules-2.0.0",
+  "otaProtocol":2,
+  "signature":{"algorithm":"ed25519","value":"base64","keyId":"release-1"}
 }
 ```
 
-The ESP32 selects the inactive OTA app partition, erases it through `esp_ota_begin()`, resets its byte counter, and begins a streaming SHA-256 calculation. It notifies `READY` only after that setup succeeds.
+The ESP32 validates authorization, product, hardware, OTA protocol, version,
+anti-rollback floor, signature, image size, and inactive partition before
+preparing the target. It reports `READY` only after preparation succeeds.
+Preparation may emit `PREPARING` first.
 
-### End
+End:
 
 ```json
 {"command":"end"}
 ```
 
-The device requires the received byte count to equal `size`, calls `esp_ota_end()` for image validation, compares SHA-256, sets the new partition bootable, notifies `SUCCESS`, waits about one second, and restarts.
+The device requires the received byte count to equal `size`, validates the ESP
+application image, compares SHA-256, checks the embedded image version against
+`version`, and selects the new boot partition only after every check passes.
+It then reports `SUCCESS`, waits briefly, and restarts.
 
-### Abort
+Abort:
 
 ```json
 {"command":"abort"}
 ```
 
-The active OTA handle is aborted and the current boot partition is not changed.
+The active OTA handle is aborted and the current boot partition is unchanged.
 
 ## Firmware data
 
-Firmware Data contains the exact raw bytes of the ESP-IDF application `.bin`. Do not send JSON, Base64, a file header, or a checksum prefix. The client may use the negotiated ATT MTU and write-without-response; the ESP32 does not assume a 20-byte payload. Every write is appended in order, and a write that would exceed the declared size fails and aborts the update.
+Firmware Data contains the exact raw bytes of the application `.bin`. Do not
+send JSON, Base64, a file header, or a checksum prefix. The client owns packet
+sizing and pacing. Fast-capable iOS clients send sequential Write Without
+Response packets in an eight-packet window, waiting for CoreBluetooth capacity
+and device `PROGRESS` credits. Compatible clients may use sequential Write With
+Response packets as a fallback. Firmware accepts non-empty sequential ATT
+writes up to 512 bytes, never assumes 20-byte packets, and copies each packet
+into a bounded queue before returning from the BLE callback. Flash writes and
+SHA-256 updates run serially outside the callback. `END` drains this queue
+before checking the received size or beginning verification.
 
-## Status messages
+The final `PROGRESS:<size>:<size>` notification is emitted only after the last
+queued packet has been written to flash. The client must receive that status
+before sending `END`.
 
-Status notifications are UTF-8 strings. New controller/runtime messages use
-compact protocol-v2 frames:
+## Status messages and errors
+
+OTA statuses remain plain UTF-8 strings:
 
 ```text
-F2<messageId:2 base36><chunkIndex:2 base36><chunkCount:3 base36><payloadLength:3 base36><crc16:4 hex><payload:0-4 bytes>
-```
-
-The CRC-16 is calculated over the complete UTF-8 JSON payload. The iOS client
-rejects incomplete, incorrectly sized, or invalid-CRC messages. Older
-unframed status strings and `C<id>:<index>/<total>:` fragments remain accepted
-for recovery, but are not emitted by the current Arduino firmware.
-
-Legacy OTA status notifications remain plain UTF-8 strings:
-
-```text
+PREPARING
 READY
-PROGRESS:32768:1048576
+WAITING_FOR_BOOT
+AUTHORIZATION_READY
+PROGRESS:<receivedBytes>:<expectedBytes>
 VERIFYING
 SUCCESS
 ABORTED
 ERROR:<code>:<description>
 ```
 
-Progress is throttled to approximately every 32 KiB and at completion. A client should treat any `ERROR:` or `ABORTED` message as a failed transfer and restart from `begin` after reconnecting or re-entering the permission window.
+Progress is emitted approximately every 4 KiB, when the OTA queue drains, and
+at completion. Queue-drain progress is required for smaller negotiated BLE
+packets so an eight-packet window can always receive a credit. Both
+implementations use these error codes where applicable:
+
+`WINDOW_CLOSED`, `ALREADY_ACTIVE`, `INVALID_BEGIN`, `INVALID_VERSION`,
+`INCOMPATIBLE_ARTIFACT`, `SIGNATURE_INVALID`, `VERSION_REJECTED`,
+`NO_PARTITION`, `IMAGE_TOO_LARGE`, `OTA_BEGIN`, `NOT_ACTIVE`,
+`SIZE_MISMATCH`, `IMAGE_INVALID`, `SHA_MISMATCH`, `VERSION_MISMATCH`,
+`WRITE_FAILED`, and `SET_BOOT`.
+
+Firmware logs include queue depth, committed byte counts, flash-write duration,
+write failures, disconnect aborts, reset reason, and watchdog/startup health
+information. These diagnostics stay out of the short status vocabulary so the
+OTA state machine remains stable.
+
+## Firmware artifact package
+
+The iOS Files picker accepts a `.ludantfirmware` directory package containing
+`manifest.json` and `firmware.bin`. The manifest contains product, hardware,
+firmware version, OTA protocol version, binary size, lowercase SHA-256,
+capabilities, minimum boot version, optional minimum partition size, release
+notes, and Ed25519 signature metadata. Release tooling must generate both files
+together and must never include a bootloader, partition table, OTA data binary,
+source code, or executable fragment.
 
 ## Device Info
 
-Example read response:
+Device Info reports at least:
 
 ```json
 {
-  "device": "electronics-controller",
-  "chip": "ESP32-S3",
-  "firmware": "arduino-modules-1.1.5",
-  "otaProtocol": 1,
-  "protocolVersion": 2,
-  "supportsModules": true,
-  "capabilities": [{"driverId":"mpu6050","version":"1.0.0"}]
+  "device":"electronics-controller",
+  "chip":"ESP32-S3",
+  "hardware":"ESP32-S3",
+  "firmware":"arduino-modules-2.0.0",
+  "otaProtocol":2,
+  "supportsOTA":true,
+  "otaCapabilities":["signed","sha256","rollback","sequential_write_with_response","sequential_write_without_response"],
+  "protocolVersion":2,
+  "otaAuthorization":"physical_button",
+  "bootVersion":"1.0.0",
+  "otaMaxImageSize":1310720
 }
 ```
 
-## Swift/CoreBluetooth sequence
+## Reboot and rollback
 
-The iOS client should:
+After `SUCCESS`, the client treats disconnect as expected, waits for the same
+peripheral to advertise, reconnects, rediscovers characteristics, reads Device
+Info, verifies the expected firmware version, and only then reports success.
+The new image confirms itself after essential startup, BLE advertising, and
+controller health checks. A failed startup remains unconfirmed so the ESP32
+bootloader can roll back.
 
-1. Scan for the OTA service UUID and connect.
-2. Discover the five characteristics.
-3. Subscribe to Status notifications before sending Control.
-4. Read Device Info if desired.
-5. Ensure the device is within its OTA permission window, then write `begin` to Control.
-6. Wait for `READY` (and handle `ERROR:`).
-7. Split the exact application `.bin` bytes into packets no larger than the negotiated `maximumWriteValueLength(for: .withoutResponse)` and call `writeValue(_:for:type: .withoutResponse)` in order. If flow control is needed, wait for `canSendWriteWithoutResponse` before continuing. The iOS client owns packet pacing; the ESP32 only guarantees sequential handling of each ATT write.
-8. After every byte is sent, write `end` to Control.
-9. Wait for `VERIFYING` and `SUCCESS`. The connection will close when the ESP32 reboots.
-10. Reconnect after advertising resumes and read Device Info to confirm the new version.
+Existing controller protocol-v2 commands remain on Control and Status. Legacy
+JSON telemetry continues on Status, while binary telemetry uses the dedicated
+Telemetry characteristic. All telemetry is unavailable while OTA is active.
 
-The SHA-256 must be calculated over the exact bytes transmitted, not over the source project or an archive. Use lowercase hexadecimal in the JSON request.
+## Binary telemetry
 
-## Controller messages
+Current and future modules use the same generic binary-v2 stream. New clients
+request `"telemetryTransport":"binary-v2"` in the `start_telemetry` or
+`set_live_interval` command when the Telemetry characteristic is present.
+Older firmware that does not understand this value continues to emit legacy
+JSON telemetry over Status; clients omit the field when the characteristic is
+not present.
 
-The same Control and Status characteristics also carry the controller protocol. OTA
-commands continue to use the text status messages above; all controller replies and
-telemetry packets are UTF-8 JSON. Requests are serialized by the client and include a
-unique `requestId`.
+Each logical sample is represented by a binary payload. The payload is split
+into BLE notifications when it is larger than one ATT payload, so transport
+size is bounded without JSON serialization or status-channel fragmentation.
+Every notification is at most 20 bytes on an MTU-23 link.
 
-```json
-{"command":"get_state","requestId":"..."}
-{"command":"apply_modules","requestId":"...","baseRevision":11,"modules":[]}
-{"command":"configure_module","requestId":"...","module":{}}
-{"command":"remove_module","requestId":"...","instanceId":"..."}
-{"command":"set_module_enabled","requestId":"...","instanceId":"...","enabled":true}
-{"command":"start_telemetry","requestId":"...","instanceId":"...","intervalMs":1000}
-{"command":"stop_telemetry","requestId":"...","instanceId":"..."}
-{"command":"set_live_interval","requestId":"...","instanceId":"...","intervalMs":250}
-```
+The first-fragment header is 11 bytes:
 
-`apply_modules` replaces the complete desired module list in one operation. The
-request includes the revision from which the local draft was created. The
-controller validates every module, GPIO conflict, I2C address conflict, and driver,
-rejects stale revisions, then writes a new revisioned configuration slot before
-activating it. A failed request leaves the previously persisted module configuration
-unchanged. A successful request returns the resulting complete controller state in
-`payload.state`, including `configRevision` and `configHash`.
+| Offset | Size | Field | Encoding |
+| ---: | ---: | --- | --- |
+| 0 | 1 | magic | `0x54` |
+| 1 | 1 | version | `2` |
+| 2 | 1 | flags | start=`0x01`, end=`0x02`; both may be set |
+| 3 | 2 | sequence | UInt16 little-endian, wraps naturally |
+| 5 | 4 | uptimeMs | UInt32 little-endian |
+| 9 | 2 | payloadLength | UInt16 little-endian |
+| 11 | 0–9 | payload prefix | binary payload bytes |
 
-Control requests that fit within the negotiated write size are sent as plain JSON.
-Larger requests use binary `C2` command frames on the same Control characteristic:
+Continuation headers are 7 bytes and contain magic, version, flags, sequence,
+and a UInt16 little-endian payload offset at offset 5. Continuation payload
+capacity is 13 bytes. Fragments must arrive in order and retain the same
+sequence number.
 
-```text
-C2 version(1) messageId(u16 LE) chunkIndex(u16 LE) chunkCount(u16 LE)
-   messageLength(u16 LE) crc16(u16 LE) payload(bytes)
-```
+The payload is encoded as follows:
 
-The frame header is 12 bytes. The client sends frames sequentially and waits for
-the BLE write acknowledgement before sending the next one. The ESP32 requires
-frames in order, reassembles the complete JSON payload, validates its length and
-CRC-16, and only then queues it for command processing. Partial or expired messages
-are discarded without changing controller state. The maximum complete command is
-2047 bytes, matching the controller command buffer.
+| Offset | Size | Field | Encoding |
+| ---: | ---: | --- | --- |
+| 0 | 1 | quality | `0` = ok, non-zero = unavailable |
+| 1 | 1 | fieldCount | Maximum 16 |
+| 2 | 1 | errorLength | UTF-8 byte count |
+| 3 | N | error | UTF-8 error text |
+| ... | 1 | nameLength | UTF-8 byte count, maximum 31 |
+| ... | N | name | Numeric field name |
+| ... | 4 | value | IEEE-754 Float32 little-endian |
 
-Replies have the following envelope:
+The name/value record repeats `fieldCount` times. Existing modules expose
+`state`, `moisture`, `accelX/Y/Z`, `gyroX/Y/Z`, `temperature`, `pressure`, and
+`humidity` as applicable. iOS converts these fields to the existing normalized
+`[String: Double]` telemetry model, so dashboard and history code is
+transport-agnostic. The firmware queue is bounded and drops the oldest sample
+when full; sequence numbers make that loss observable.
 
-```json
-{"type":"response","requestId":"...","protocolVersion":2,"ok":true,"configRevision":12,"configHash":"...","payload":{}}
-```
+The old fixed 20-byte binary-v1 MPU6050 frame remains decodable by iOS for
+compatibility with the interim firmware. It is not used for new module
+implementations.
 
-Telemetry is emitted as:
-
-```json
-{"type":"telemetry","protocolVersion":2,"sequence":42,"uptimeMs":123456,"deviceId":"...","instanceId":"...","quality":"ok","error":null,"values":{}}
-```
-
-Module configurations are persisted on the controller only after validation. The
-initial firmware advertises MPU6050, BME280, analog soil-moisture, and relay drivers;
-future drivers can be added to the module registry without changing the BLE transport.
+Telemetry uses a bounded firmware queue and prioritizes command responses over
+samples. If the queue fills, the oldest sample is discarded; clients detect
+that condition from the sequence gap. Sensor errors remain JSON status packets
+so unavailable-sensor states retain their diagnostic text.

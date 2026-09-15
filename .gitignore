@@ -54,3 +54,6 @@ areas/firmware/esp32s3-ota/build/
 areas/firmware/esp32s3-ota/sdkconfig
 areas/firmware/esp32s3-ota/sdkconfig.old
 areas/firmware/esp32s3-ota/dependencies.lock
+
+# Firebase credentials
+apps/ui/ludant-ios/ludant-ios/GoogleService-Info.plist

@@ -10,6 +10,8 @@ public:
     const char* deviceId() const { return device_id_.c_str(); }
     const char* friendlyName() const { return friendly_name_.c_str(); }
     const char* firmwareVersion() const;
+    const char* bootVersion() const;
+    uint32_t otaMaxImageSize() const;
 
 private:
     std::string device_id_;

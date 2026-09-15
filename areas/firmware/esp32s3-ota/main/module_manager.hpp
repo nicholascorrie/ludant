@@ -5,8 +5,10 @@
 #include <string>
 
 #include "device_info.hpp"
+#include "../shared/telemetry_frame.hpp"
 
 using ModuleOutputCallback = void (*)(const char* message, void* context);
+using ModuleTelemetryCallback = void (*)(const ludant::BinaryTelemetryPacket& packet, void* context);
 
 class ModuleManager {
 public:
@@ -14,6 +16,7 @@ public:
     ~ModuleManager();
 
     void setOutputCallback(ModuleOutputCallback callback, void* context);
+    void setTelemetryCallback(ModuleTelemetryCallback callback, void* context);
     bool begin();
     bool handleCommand(const char* message, size_t length);
     void stopTelemetry();
@@ -40,10 +43,14 @@ private:
 
     ModuleOutputCallback output_callback_{nullptr};
     void* output_context_{nullptr};
+    ModuleTelemetryCallback telemetry_callback_{nullptr};
+    void* telemetry_context_{nullptr};
     const DeviceInfo& device_info_;
     std::string modules_json_{"[]"};
     std::string telemetry_instance_;
     uint32_t telemetry_interval_ms_{1000};
     void* telemetry_task_{nullptr};
     bool telemetry_running_{false};
+    bool binary_telemetry_enabled_{false};
+    uint32_t telemetry_sequence_{0};
 };

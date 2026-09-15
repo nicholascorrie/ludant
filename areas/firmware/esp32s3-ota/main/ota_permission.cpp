@@ -22,8 +22,14 @@ esp_err_t OtaPermission::begin() {
     }
 
     boot_time_us_ = esp_timer_get_time();
-    ESP_LOGI(TAG, "OTA permission window open for %d seconds; BOOT button GPIO%d can extend it",
-             CONFIG_LUDANT_OTA_WINDOW_SECONDS, CONFIG_LUDANT_BOOT_BUTTON_GPIO);
+    ESP_LOGI(TAG, "OTA authorization: physical BOOT button GPIO%d required; development timed window=%s (%d seconds)",
+             CONFIG_LUDANT_BOOT_BUTTON_GPIO,
+#if CONFIG_LUDANT_OTA_DEVELOPMENT_WINDOW
+             "enabled",
+#else
+             "disabled",
+#endif
+             CONFIG_LUDANT_OTA_WINDOW_SECONDS);
     return ESP_OK;
 }
 
@@ -39,5 +45,9 @@ bool OtaPermission::isAllowed() const {
     const int64_t elapsed_us = elapsedSinceBootUs();
     const bool within_boot_window = elapsed_us >= 0 && elapsed_us < window_us;
     const bool boot_button_held = gpio_get_level(static_cast<gpio_num_t>(CONFIG_LUDANT_BOOT_BUTTON_GPIO)) == 0;
+#if CONFIG_LUDANT_OTA_DEVELOPMENT_WINDOW
     return within_boot_window || boot_button_held;
+#else
+    return boot_button_held;
+#endif
 }

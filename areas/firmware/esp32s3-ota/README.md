@@ -4,6 +4,10 @@ The Arduino IDE sketch is the primary installation path for Ludant electronics
 controllers. This directory also contains the equivalent ESP-IDF implementation
 for builds that need it; both runtimes use the same BLE protocol.
 
+For the intended architecture and guidance for LLM-assisted changes, see
+[AGENTS.md](AGENTS.md). In short, keep the ESP32 runtime deterministic and
+minimal; the Swift iOS app owns domain policy, orchestration, and UX.
+
 ## Hardware and flash assumptions
 
 - Target: ESP32-S3 development board.
@@ -35,22 +39,74 @@ The build generates `build/ludant_esp32s3_ota.bin`. That is the application imag
 
 ## OTA safety behaviour
 
-OTA `BEGIN` is accepted for 120 seconds after boot, or whenever the configured BOOT button is held. An update writes to `esp_ota_get_next_update_partition()` and never targets the running partition.
+Production OTA `BEGIN` is accepted only while the configured BOOT button is
+held. Development ESP-IDF builds can opt into the timed boot window through
+menuconfig; Arduino builds use `-DLUDANT_OTA_DEVELOPMENT_WINDOW_SECONDS=120`.
+Every accepted artifact must also pass Ed25519 signature verification using the
+release public key compiled into the firmware.
 
 The transfer is accepted in this order:
 
 1. Subscribe to Status notifications.
 2. Write a JSON `begin` command to Control.
-3. Wait for `READY`.
-4. Write the raw `.bin` bytes sequentially to Firmware Data. Use write-without-response where supported and do not add JSON or Base64 around the bytes.
-5. Write `{"command":"end"}` to Control.
+3. Wait for `PREPARING`, then `READY`.
+4. Write the raw `.bin` bytes sequentially to Firmware Data. Fast-capable
+   clients use write-without-response packets in an eight-packet window;
+   compatible clients may use write-with-response packets. Do not add JSON or
+   Base64 around the bytes.
+5. Wait for the final `PROGRESS:<size>:<size>` confirmation, then write
+   `{"command":"end"}` to Control.
 6. Wait for `VERIFYING`, then `SUCCESS`. The device waits about one second and reboots.
 
-`esp_ota_end()` validates the ESP application image. The firmware also compares a streaming SHA-256 digest against the lowercase hex value supplied in `BEGIN`, then calls `esp_ota_set_boot_partition()` only after both validations succeed. Disconnects, aborts, short transfers, oversize images, write failures, invalid images, and hash mismatches leave the currently running app selected.
+`esp_ota_end()` validates the ESP application image. Firmware data is copied
+from the BLE callback into a bounded 512-byte packet queue; flash writes and
+SHA-256 updates run serially in the main loop/OTA worker. `END` waits for that
+queue to drain, and the final `PROGRESS:<size>:<size>` is sent only after the
+last packet is committed. The firmware then compares a streaming SHA-256
+digest against the lowercase hex value supplied in `BEGIN`, and calls
+`esp_ota_set_boot_partition()` only after both validations succeed. Disconnects,
+aborts, short transfers, oversize images, queue overflow, write failures,
+invalid images, and hash mismatches leave the currently running app selected.
 
 Rollback is enabled in `sdkconfig.defaults`. The startup path confirms a pending image with `esp_ota_mark_app_valid_cancel_rollback()` after basic initialization. Future application firmware that uses this OTA layer should call the same API as early as possible after its own startup checks; an unconfirmed new OTA image can be rolled back by the ESP-IDF bootloader after a failed first boot.
 
-SHA-256 proves transfer integrity, not publisher authenticity. Before production use, add authentication and signed-image verification at the `OtaPermission`/`OtaManager` boundary and enable ESP-IDF secure boot and flash encryption as appropriate.
+SHA-256 provides transfer integrity while the Ed25519 signature provides
+publisher authenticity. The release public key is supplied as
+`CONFIG_LUDANT_OTA_PUBLIC_KEY_DER_HEX` for ESP-IDF and
+`LUDANT_OTA_PUBLIC_KEY_DER_HEX` for Arduino. An empty key rejects OTA.
+
+Create a package for iOS from an application image with:
+
+```sh
+LUDANT_OTA_SIGNING_PRIVATE_KEY="$(cat release-ed25519-private.pem)" \
+node tools/create-firmware-artifact.mjs build/ludant_esp32s3_ota.bin \
+  release/ludant-2.0.0.ludantfirmware --version arduino-modules-2.0.0
+```
+
+The command prints both public-key encodings: inject `publicKeyDerHex` into
+ESP-IDF/Arduino firmware as `LUDANT_OTA_PUBLIC_KEY_DER_HEX`, and inject
+`publicKeyRawBase64` into the iOS `LUDANT_OTA_PUBLIC_KEY` build setting. Never
+commit the private key or send bootloader, partition-table, or OTA-data
+binaries.
+
+### Increment and release an Arduino version
+
+The workspace includes a guarded release command that increments the current
+Arduino sketch version, injects the signing public key, compiles the application
+image, creates the signed `.ludantfirmware` package in the iOS resource folder,
+and updates `FirmwareCatalog.json`:
+
+```sh
+LUDANT_OTA_SIGNING_KEY_FILE="$HOME/.config/ludant/ota-ed25519-private.pem" \
+npm run firmware:release -- patch
+```
+
+Use `minor` or `major` instead of `patch` when appropriate. Add `--dry-run` to
+preview the next version and asset path without changing files. Set
+`LUDANT_ARDUINO_FQBN` when using a different ESP32-S3 board definition. The
+command refuses to overwrite an existing catalog version or asset and restores
+source edits if compilation or signing fails. It requires `arduino-cli` and an
+Ed25519 release key; the private key is never written to the repository.
 
 ## Manual test
 
