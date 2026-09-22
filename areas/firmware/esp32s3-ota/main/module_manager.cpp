@@ -58,6 +58,33 @@ cJSON* configuration(cJSON* module) { return objectItem(module, "configuration")
 cJSON* pins(cJSON* module) { return objectItem(configuration(module), "pins"); }
 cJSON* parameters(cJSON* module) { return objectItem(configuration(module), "parameters"); }
 
+const char* implementationVersion(const char* plugin) {
+    if (plugin == nullptr) return "unknown";
+    if (std::strcmp(plugin, "sensor.mpu6050") == 0 ||
+        std::strcmp(plugin, "sensor.bme280") == 0 ||
+        std::strcmp(plugin, "sensor.soil-moisture") == 0 ||
+        std::strcmp(plugin, "actuator.relay") == 0) {
+        return "1.0.0";
+    }
+    return "unknown";
+}
+
+void setObjectItem(cJSON* object, const char* name, cJSON* value) {
+    if (!cJSON_IsObject(object) || name == nullptr || value == nullptr) {
+        cJSON_Delete(value);
+        return;
+    }
+    cJSON_DeleteItemFromObjectCaseSensitive(object, name);
+    cJSON_AddItemToObject(object, name, value);
+}
+
+void annotateModule(cJSON* module) {
+    if (!cJSON_IsObject(module)) return;
+    const char* plugin = stringItem(module, "pluginId");
+    setObjectItem(module, "configurationSchemaVersion", cJSON_CreateNumber(1));
+    setObjectItem(module, "implementationVersion", cJSON_CreateString(implementationVersion(plugin)));
+}
+
 bool sharesPin(cJSON* first, cJSON* second) {
     cJSON* first_item = nullptr;
     cJSON_ArrayForEach(first_item, first) {
@@ -142,20 +169,29 @@ void ModuleManager::setTelemetryCallback(ModuleTelemetryCallback callback, void*
 }
 
 bool ModuleManager::begin() {
+    return loadPersistedModules();
+}
+
+bool ModuleManager::loadPersistedModules() {
+    std::string stored;
     nvs_handle_t handle;
-    if (nvs_open(kNvsNamespace, NVS_READONLY, &handle) == ESP_OK) {
+    if (nvs_open(kNvsNamespace, NVS_READWRITE, &handle) == ESP_OK) {
         size_t size = 0;
         if (nvs_get_str(handle, kModulesKey, nullptr, &size) == ESP_OK && size > 1) {
-            std::string stored(size, '\0');
+            stored.assign(size, '\0');
             if (nvs_get_str(handle, kModulesKey, stored.data(), &size) == ESP_OK) {
                 stored.resize(std::strlen(stored.c_str()));
-                if (cJSON* parsed = cJSON_Parse(stored.c_str()); parsed != nullptr && cJSON_IsArray(parsed)) {
-                    modules_json_ = stored;
-                    cJSON_Delete(parsed);
-                }
             }
         }
         nvs_close(handle);
+    }
+    if (!stored.empty() && !normalizePersistedModules(stored.c_str())) {
+        nvs_handle_t backup_handle;
+        if (nvs_open(kNvsNamespace, NVS_READWRITE, &backup_handle) == ESP_OK) {
+            nvs_set_str(backup_handle, "modules_backup", stored.c_str());
+            nvs_commit(backup_handle);
+            nvs_close(backup_handle);
+        }
     }
     return true;
 }
@@ -163,9 +199,93 @@ bool ModuleManager::begin() {
 void ModuleManager::persistModules() {
     nvs_handle_t handle;
     if (nvs_open(kNvsNamespace, NVS_READWRITE, &handle) != ESP_OK) return;
-    nvs_set_str(handle, kModulesKey, modules_json_.c_str());
+    cJSON* envelope = cJSON_CreateObject();
+    cJSON_AddNumberToObject(envelope, "schemaVersion", kStateSchemaVersion);
+    cJSON* modules = cJSON_Parse(modules_json_.c_str());
+    cJSON_AddItemToObject(envelope, "modules", modules != nullptr && cJSON_IsArray(modules) ? modules : cJSON_CreateArray());
+    char* serialized = cJSON_PrintUnformatted(envelope);
+    if (serialized != nullptr) {
+        nvs_set_str(handle, kModulesKey, serialized);
+        cJSON_free(serialized);
+    }
+    cJSON_Delete(envelope);
     nvs_commit(handle);
     nvs_close(handle);
+}
+
+bool ModuleManager::normalizePersistedModules(const char* serialized) {
+    cJSON* parsed = cJSON_Parse(serialized);
+    if (parsed == nullptr) {
+        migration_error_ = "stored module configuration is not valid JSON";
+        return false;
+    }
+
+    cJSON* modules = parsed;
+    bool needsMigration = true;
+    if (cJSON_IsObject(parsed)) {
+        cJSON* schema = objectItem(parsed, "schemaVersion");
+        cJSON* envelopeModules = objectItem(parsed, "modules");
+        if (!cJSON_IsNumber(schema) || !cJSON_IsArray(envelopeModules) || schema->valueint < 1 || schema->valueint > kStateSchemaVersion) {
+            cJSON_Delete(parsed);
+            migration_error_ = "stored module configuration schema is unsupported";
+            return false;
+        }
+        modules = envelopeModules;
+        needsMigration = schema->valueint != kStateSchemaVersion;
+    }
+    if (!cJSON_IsArray(modules)) {
+        cJSON_Delete(parsed);
+        migration_error_ = "stored module configuration must contain an array";
+        return false;
+    }
+
+    cJSON* normalized = cJSON_CreateArray();
+    cJSON* item = nullptr;
+    int rejected = 0;
+    cJSON_ArrayForEach(item, modules) {
+        const char* error = nullptr;
+        if (validateModule(item, &error)) {
+            if (!cJSON_IsNumber(objectItem(item, "configurationSchemaVersion")) ||
+                !cJSON_IsString(objectItem(item, "implementationVersion"))) {
+                needsMigration = true;
+            }
+            cJSON* copy = cJSON_Duplicate(item, true);
+            annotateModule(copy);
+            cJSON_AddItemToArray(normalized, copy);
+        } else {
+            ++rejected;
+            // Preserve the original record so a future firmware can migrate
+            // it. Disable only this module instead of silently deleting user
+            // configuration or clearing the complete module set.
+            cJSON* copy = cJSON_Duplicate(item, true);
+            if (cJSON_IsObject(copy)) {
+                setObjectItem(copy, "enabled", cJSON_CreateBool(false));
+                setObjectItem(copy, "migrationError", cJSON_CreateString(error == nullptr ? "unsupported module configuration" : error));
+                annotateModule(copy);
+                cJSON_AddItemToArray(normalized, copy);
+            } else {
+                cJSON_Delete(copy);
+            }
+        }
+    }
+    char* normalizedText = cJSON_PrintUnformatted(normalized);
+    if (normalizedText == nullptr) {
+        cJSON_Delete(normalized);
+        cJSON_Delete(parsed);
+        migration_error_ = "could not normalize stored module configuration";
+        return false;
+    }
+    modules_json_ = normalizedText;
+    cJSON_free(normalizedText);
+    cJSON_Delete(normalized);
+    cJSON_Delete(parsed);
+    if (rejected > 0) {
+        migration_error_ = "one or more stored modules were disabled because their configuration is no longer supported";
+        persistModules();
+    } else if (needsMigration) {
+        persistModules();
+    }
+    return true;
 }
 
 int ModuleManager::pinValue(void* rawModule, const char* name) const {
@@ -249,12 +369,22 @@ bool ModuleManager::validateModuleSet(void* rawModules, const char** error) cons
 
 bool ModuleManager::replaceModules(void* rawModules) {
     cJSON* modules = static_cast<cJSON*>(rawModules);
-    char* serialized = cJSON_PrintUnformatted(modules);
-    if (serialized == nullptr) return false;
+    cJSON* copy = cJSON_Duplicate(modules, true);
+    if (copy == nullptr || !cJSON_IsArray(copy)) {
+        cJSON_Delete(copy);
+        return false;
+    }
+    cJSON* item = nullptr;
+    cJSON_ArrayForEach(item, copy) annotateModule(item);
+    char* serialized = cJSON_PrintUnformatted(copy);
+    if (serialized == nullptr) {
+        cJSON_Delete(copy);
+        return false;
+    }
     modules_json_ = serialized;
     cJSON_free(serialized);
-    cJSON* item = nullptr;
-    cJSON_ArrayForEach(item, modules) configureRelay(item);
+    cJSON_ArrayForEach(item, copy) configureRelay(item);
+    cJSON_Delete(copy);
     persistModules();
     return true;
 }
@@ -288,6 +418,8 @@ void* ModuleManager::statePayload() const {
     cJSON_AddItemToObject(state, "capabilities", capabilities);
     cJSON* modules = cJSON_Parse(modules_json_.c_str());
     cJSON_AddItemToObject(state, "modules", modules == nullptr ? cJSON_CreateArray() : modules);
+    cJSON_AddNumberToObject(state, "moduleStateSchemaVersion", kStateSchemaVersion);
+    if (!migration_error_.empty()) cJSON_AddStringToObject(state, "moduleMigrationError", migration_error_.c_str());
     cJSON* gpios = cJSON_CreateArray();
     for (int gpio : kAvailableGpios) cJSON_AddItemToArray(gpios, cJSON_CreateNumber(gpio));
     cJSON_AddItemToObject(state, "availableGPIOs", gpios);
@@ -344,6 +476,7 @@ bool ModuleManager::handleCommand(const char* message, size_t length) {
                 }
             }
             if (modules == nullptr) modules = cJSON_CreateArray();
+            annotateModule(module);
             if (replaced) {
                 for (int index = cJSON_GetArraySize(modules) - 1; index >= 0; --index) {
                     cJSON* existing = cJSON_GetArrayItem(modules, index);
@@ -366,8 +499,9 @@ bool ModuleManager::handleCommand(const char* message, size_t length) {
             cJSON* item = cJSON_GetArrayItem(modules, index);
             const char* existing_id = stringItem(item, "instanceId");
             if (instance_id != nullptr && existing_id != nullptr && std::strcmp(existing_id, instance_id) == 0) cJSON_DeleteItemFromArray(modules, index);
-        }
-        char* serialized = cJSON_PrintUnformatted(modules);
+            }
+            cJSON_ArrayForEach(item, modules) annotateModule(item);
+            char* serialized = cJSON_PrintUnformatted(modules);
         if (serialized != nullptr) { modules_json_ = serialized; cJSON_free(serialized); }
         cJSON_Delete(modules); persistModules(); emitResponse(request_id, true, nullptr, nullptr);
     } else if (std::strcmp(command, "set_module_enabled") == 0) {
@@ -419,6 +553,7 @@ void ModuleManager::emitTelemetry() {
         if (existing_id != nullptr && std::strcmp(existing_id, telemetry_instance_.c_str()) == 0) break;
     }
     if (module == nullptr) { cJSON_Delete(modules); return; }
+    if (cJSON_IsFalse(objectItem(module, "enabled"))) { cJSON_Delete(modules); return; }
     const char* plugin = stringItem(module, "pluginId");
     const bool use_binary = binary_telemetry_enabled_ && telemetry_callback_ != nullptr;
     cJSON* values = use_binary ? nullptr : cJSON_CreateObject();
@@ -551,7 +686,8 @@ bool ModuleManager::configureRelay(void* rawModule) const {
     int output = pinValue(module, "output");
     gpio_config_t config{}; config.pin_bit_mask = 1ULL << output; config.mode = GPIO_MODE_OUTPUT; config.pull_down_en = GPIO_PULLDOWN_DISABLE; config.pull_up_en = GPIO_PULLUP_DISABLE; config.intr_type = GPIO_INTR_DISABLE;
     if (gpio_config(&config) != ESP_OK) return false;
-    int state = parameterValue(module, "state", 0); int active_high = parameterValue(module, "activeHigh", 1);
+    int state = cJSON_IsFalse(objectItem(module, "enabled")) ? 0 : parameterValue(module, "state", 0);
+    int active_high = parameterValue(module, "activeHigh", 1);
     gpio_set_level(static_cast<gpio_num_t>(output), active_high ? state : !state);
     return true;
 }

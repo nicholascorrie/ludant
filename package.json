@@ -3,7 +3,8 @@
   "version": "0.0.0",
   "license": "MIT",
   "scripts": {
-    "firmware:release": "node areas/firmware/esp32s3-ota/tools/release-arduino-firmware.mjs"
+    "firmware:release": "node areas/firmware/esp32s3-ota/tools/release-esp-idf-firmware.mjs",
+    "firmware:validate": "node areas/firmware/esp32s3-ota/tools/validate-firmware-catalog.mjs"
   },
   "private": true,
   "dependencies": {},

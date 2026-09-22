@@ -7,6 +7,15 @@ config LUDANT_FIRMWARE_VERSION
         Version reported by the Device Info characteristic when the build
         does not provide another application version.
 
+config LUDANT_SECURE_VERSION
+    int "Firmware secure version"
+    range 0 65535
+    default 0
+    help
+        Monotonic anti-rollback value embedded in production firmware.
+        Increase this value whenever a release must make older secure
+        versions permanently unavailable.
+
 config LUDANT_OTA_WINDOW_SECONDS
     int "OTA permission window after boot (seconds)"
     range 1 3600

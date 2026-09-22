@@ -7,7 +7,7 @@ import path from 'node:path';
 const OTA_SLOT_SIZE = 1_310_720;
 
 function usage() {
-  console.error('Usage: create-firmware-artifact.mjs <firmware.bin> <output.ludantfirmware> --version <version> [--capabilities a,b] [--minimum-boot-version 1.0.0] [--minimum-partition-size bytes] [--release-notes text] [--key-id id]');
+  console.error('Usage: create-firmware-artifact.mjs <firmware.bin> <output.ludantfirmware> --version <version> [--runtime esp-idf] [--secure-version n] [--capabilities a,b] [--minimum-boot-version 1.0.0] [--minimum-partition-size bytes] [--release-notes text] [--key-id id]');
   process.exit(2);
 }
 
@@ -49,10 +49,19 @@ const minimumPartitionSize = options['minimum-partition-size'] ? Number(options[
 if (minimumPartitionSize !== undefined && (!Number.isSafeInteger(minimumPartitionSize) || minimumPartitionSize <= 0)) {
   throw new Error('--minimum-partition-size must be a positive integer');
 }
+const runtime = options.runtime ?? 'esp-idf';
+if (!['esp-idf', 'arduino'].includes(runtime)) throw new Error('--runtime must be esp-idf or arduino');
+const secureVersion = options['secure-version'] == null ? undefined : Number(options['secure-version']);
+if (secureVersion !== undefined && (!Number.isSafeInteger(secureVersion) || secureVersion < 0)) {
+  throw new Error('--secure-version must be a non-negative integer');
+}
+const moduleImplementations = options['module-implementations'] ? JSON.parse(options['module-implementations']) : {};
+const moduleSchemas = options['module-schemas'] ? JSON.parse(options['module-schemas']) : {};
 
 const manifest = {
   product: 'ludant-esp32s3',
   hardware: 'ESP32-S3',
+  runtime,
   firmwareVersion: options.version,
   otaProtocolVersion: 2,
   size: firmware.length,
@@ -60,6 +69,9 @@ const manifest = {
   capabilities: (options.capabilities ?? 'modules,telemetry,ota').split(',').filter(Boolean),
   minimumBootVersion,
   ...(minimumPartitionSize !== undefined ? { minimumPartitionSize } : {}),
+  ...(secureVersion !== undefined ? { secureVersion } : {}),
+  moduleImplementations,
+  moduleSchemas,
   ...(options['release-notes'] ? { releaseNotes: options['release-notes'] } : {}),
   signature: {
     algorithm: 'ed25519',

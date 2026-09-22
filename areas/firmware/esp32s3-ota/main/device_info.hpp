@@ -12,6 +12,7 @@ public:
     const char* firmwareVersion() const;
     const char* bootVersion() const;
     uint32_t otaMaxImageSize() const;
+    int secureVersion() const;
 
 private:
     std::string device_id_;

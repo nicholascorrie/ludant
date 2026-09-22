@@ -81,12 +81,22 @@ uint32_t DeviceInfo::otaMaxImageSize() const {
     return partition == nullptr ? 0 : partition->size;
 }
 
+int DeviceInfo::secureVersion() const {
+#ifdef CONFIG_BOOTLOADER_APP_SECURE_VERSION
+    return CONFIG_BOOTLOADER_APP_SECURE_VERSION;
+#else
+    return CONFIG_LUDANT_SECURE_VERSION;
+#endif
+}
+
 std::string DeviceInfo::json() const {
     const char* ota_authorization = "physical_button";
 #if CONFIG_LUDANT_OTA_DEVELOPMENT_WINDOW
     ota_authorization = "physical_button_or_timed_window";
 #endif
-    return std::string("{\"device\":\"electronics-controller\",\"chip\":\"ESP32-S3\",\"hardware\":\"ESP32-S3\",\"firmware\":\"") +
+    return std::string("{\"device\":\"electronics-controller\",\"chip\":\"ESP32-S3\",\"hardware\":\"ESP32-S3\",\"runtime\":\"esp-idf\",\"secureVersion\":") +
+        std::to_string(secureVersion()) +
+        ",\"moduleStateSchemaVersion\":1,\"moduleImplementations\":{\"sensor.mpu6050\":\"1.0.0\",\"sensor.bme280\":\"1.0.0\",\"sensor.soil-moisture\":\"1.0.0\",\"actuator.relay\":\"1.0.0\"},\"moduleSchemas\":{\"sensor.mpu6050\":1,\"sensor.bme280\":1,\"sensor.soil-moisture\":1,\"actuator.relay\":1},\"firmware\":\"") +
         escapeJson(firmwareVersion()) +
         "\",\"otaProtocol\":2,\"protocolVersion\":2,\"supportsOTA\":true,\"otaCapabilities\":[\"signed\",\"sha256\",\"rollback\",\"sequential_write_with_response\",\"sequential_write_without_response\"],\"supportsModules\":true,\"otaAuthorization\":\"" + ota_authorization + "\",\"bootVersion\":\"" +
         escapeJson(bootVersion()) +

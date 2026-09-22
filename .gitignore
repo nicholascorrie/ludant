@@ -51,9 +51,9 @@ Thumbs.db
 
 # ESP-IDF generated output
 areas/firmware/esp32s3-ota/build/
+areas/firmware/esp32s3-ota/arduino/**/build/
+apps/ui/ludant-ios/build/
+apps/ui/ludant-ios/**/DerivedData/
 areas/firmware/esp32s3-ota/sdkconfig
 areas/firmware/esp32s3-ota/sdkconfig.old
 areas/firmware/esp32s3-ota/dependencies.lock
-
-# Firebase credentials
-apps/ui/ludant-ios/ludant-ios/GoogleService-Info.plist

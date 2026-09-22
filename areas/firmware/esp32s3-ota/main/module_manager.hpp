@@ -22,6 +22,8 @@ public:
     void stopTelemetry();
 
     const char* modulesJson() const { return modules_json_.c_str(); }
+    int stateSchemaVersion() const { return kStateSchemaVersion; }
+    const char* migrationError() const { return migration_error_.empty() ? nullptr : migration_error_.c_str(); }
 
 private:
     static void telemetryTask(void* argument);
@@ -40,6 +42,10 @@ private:
     int pinValue(void* module, const char* name) const;
     int parameterValue(void* module, const char* name, int fallback) const;
     void persistModules();
+    bool loadPersistedModules();
+    bool normalizePersistedModules(const char* serialized);
+
+    static constexpr int kStateSchemaVersion = 1;
 
     ModuleOutputCallback output_callback_{nullptr};
     void* output_context_{nullptr};
@@ -53,4 +59,5 @@ private:
     bool telemetry_running_{false};
     bool binary_telemetry_enabled_{false};
     uint32_t telemetry_sequence_{0};
+    std::string migration_error_;
 };

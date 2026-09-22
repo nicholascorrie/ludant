@@ -253,6 +253,7 @@ try {
     binaryPath,
     packagePath,
     '--version', nextVersion,
+    '--runtime', 'arduino',
     '--minimum-partition-size', maximumPartitionSize
   ], {
     cwd: root,

@@ -76,31 +76,31 @@ static const struct ble_gatt_svc_def services[] = {
             {
                 .uuid = &kControlUuid.u,
                 .access_cb = accessCallback,
-                .flags = BLE_GATT_CHR_F_WRITE,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
                 .val_handle = &control_handle,
             },
             {
                 .uuid = &kDataUuid.u,
                 .access_cb = accessCallback,
-                .flags = BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE,
+                .flags = BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
                 .val_handle = &data_handle,
             },
             {
                 .uuid = &kStatusUuid.u,
                 .access_cb = accessCallback,
-                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_NOTIFY,
                 .val_handle = &status_handle,
             },
             {
                 .uuid = &kDeviceInfoUuid.u,
                 .access_cb = accessCallback,
-                .flags = BLE_GATT_CHR_F_READ,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC,
                 .val_handle = &device_info_handle,
             },
             {
                 .uuid = &kTelemetryUuid.u,
                 .access_cb = accessCallback,
-                .flags = BLE_GATT_CHR_F_NOTIFY,
+                .flags = BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC,
                 .val_handle = &telemetry_handle,
             },
             { 0 },
@@ -143,6 +143,10 @@ esp_err_t BleOtaServer::start() {
     ble_hs_cfg.sync_cb = onBleSync;
     ble_hs_cfg.gatts_register_cb = gattRegisterCallback;
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_mitm = 0;
+    ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
 
     ble_svc_gap_init();
     ble_svc_gatt_init();
@@ -644,6 +648,10 @@ int BleOtaServer::gapEvent(struct ble_gap_event* event, void*) {
                 // callback reaching the controller.
                 instance_->resetCommandFrame();
                 instance_->module_manager_.stopTelemetry();
+                const int security_rc = ble_gap_security_initiate(event->connect.conn_handle);
+                if (security_rc != 0) {
+                    ESP_LOGW(TAG, "BLE security negotiation could not start: status=%d", security_rc);
+                }
                 ESP_LOGI(TAG, "BLE client connected: handle=%d", event->connect.conn_handle);
             } else {
                 ESP_LOGW(TAG, "BLE connection failed: status=%d", event->connect.status);
