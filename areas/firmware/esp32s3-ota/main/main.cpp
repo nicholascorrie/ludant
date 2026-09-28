@@ -8,6 +8,7 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
+#include "sdkconfig.h"
 
 namespace {
 constexpr char TAG[] = "ludant_main";
@@ -36,23 +37,27 @@ void confirmRunningApplication() {
 }
 
 extern "C" void app_main() {
-    ESP_LOGI(TAG, "Ludant ESP32-S3 firmware starting; resetReason=%d", static_cast<int>(esp_reset_reason()));
+    ESP_LOGI(TAG, "Ludant ESP32-S3 firmware starting; version=%s; resetReason=%d",
+        CONFIG_LUDANT_FIRMWARE_VERSION, static_cast<int>(esp_reset_reason()));
     initializeNvs();
 
-    OtaPermission permission;
+    // These services are referenced by FreeRTOS tasks and NimBLE callbacks
+    // after app_main returns. Keep them in static storage rather than on the
+    // app_main task's stack, which ESP-IDF releases when the entry point exits.
+    static OtaPermission permission;
     ESP_ERROR_CHECK(permission.begin());
 
-    DeviceInfo device_info;
+    static DeviceInfo device_info;
     ESP_ERROR_CHECK(device_info.begin() ? ESP_OK : ESP_FAIL);
-    ModuleManager module_manager(device_info);
+    static ModuleManager module_manager(device_info);
     ESP_ERROR_CHECK(module_manager.begin() ? ESP_OK : ESP_FAIL);
-    OtaManager ota_manager(permission, device_info);
-    BleOtaServer ble_server(ota_manager, device_info, module_manager);
+    static OtaManager ota_manager(permission, device_info);
+    static BleOtaServer ble_server(ota_manager, device_info, module_manager);
     ESP_ERROR_CHECK(ble_server.start());
     // The image is confirmed only after the controller, GATT database, and
     // advertising path have initialized successfully. If any of those fail,
     // the bootloader can roll back the pending image.
     confirmRunningApplication();
 
-    ESP_LOGI(TAG, "Firmware ready; normal application logic can be added alongside the OTA layer");
+    ESP_LOGI(TAG, "Firmware ready; version=%s", CONFIG_LUDANT_FIRMWARE_VERSION);
 }

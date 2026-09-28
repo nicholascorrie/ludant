@@ -1,8 +1,8 @@
 # Ludant ESP32-S3 firmware
 
-The Arduino IDE sketch is the primary installation path for Ludant electronics
-controllers. This directory also contains the equivalent ESP-IDF implementation
-for builds that need it; both runtimes use the same BLE protocol.
+The ESP-IDF firmware is the canonical Ludant runtime; an Arduino sketch is also
+provided for development. Product firmware is intentionally left open for owner
+reflashing over the ESP32-S3 ROM USB downloader.
 
 For the intended architecture and guidance for LLM-assisted changes, see
 [AGENTS.md](AGENTS.md). In short, keep the ESP32 runtime deterministic and
@@ -12,18 +12,22 @@ minimal; the Swift iOS app owns domain policy, orchestration, and UX.
 
 - Target: ESP32-S3 development board.
 - The standard BOOT button is assumed to be GPIO0 and active low. Change `CONFIG_LUDANT_BOOT_BUTTON_GPIO` in `idf.py menuconfig` for another board.
-- The custom partition table assumes a 4 MiB flash device. It provides a 1 MiB factory image and two 1.25 MiB OTA slots. Larger flash can use the remaining space by enlarging the app slots in `partitions.csv`.
-- The initial factory image is flashed over USB. Later images are written only to the inactive OTA slot.
+- The custom partition table assumes a 4 MiB flash device and provides two 1.25 MiB OTA slots. Larger flash can use the remaining space by enlarging the app slots in `partitions.csv`.
+- The initial image is flashed over USB. Later Ludant images use the inactive OTA slot over BLE.
+- Product builds leave Secure Boot, flash encryption, and eFuse anti-rollback disabled. They do not intentionally burn eFuses or disable ROM USB download mode.
 
 ## Build, flash, and monitor
 
-From this directory, after sourcing the ESP-IDF export script:
+For local development, after sourcing the ESP-IDF export script:
 
 ```sh
 idf.py set-target esp32s3
 idf.py build
-idf.py flash monitor
 ```
+
+Use `npx nx run esp32s3-ota-firmware:flash-monitor` for USB flashing. The
+workspace flash target explicitly disables and verifies irreversible security
+options before it writes to the board.
 
 The same operations are available from the Nx workspace root:
 
@@ -33,7 +37,19 @@ npx nx run esp32s3-ota-firmware:build
 npx nx run esp32s3-ota-firmware:flash-monitor
 ```
 
-If the port is not detected automatically, use `idf.py -p /dev/cu.usbmodemXXXX flash monitor`.
+For the validated full USB install of the latest signed Ludant release, use
+`npm run firmware:install` from the workspace root. It checks the build
+configuration and refuses to overwrite a board that already has Secure Boot or
+flash encryption enabled. Owners can erase and reflash an unlocked board with
+their own firmware using the standard ESP32-S3 USB ROM download tools.
+
+Do not enable Secure Boot, flash encryption in development or release mode,
+secure UART/USB download mode, or app anti-rollback in a product build. Those
+features can change one-way eFuse state on first boot. Existing devices whose
+fuses are already burned cannot be converted back to an unlocked state.
+
+If the port is not detected automatically, pass `--port /dev/cu.usbmodemXXXX`
+to `npm run firmware:install`.
 
 The build generates `build/ludant_esp32s3_ota.bin`. That is the application image the iOS client must send over BLE for later application updates. Do not send the bootloader, partition-table, or OTA data binaries.
 
@@ -68,7 +84,7 @@ digest against the lowercase hex value supplied in `BEGIN`, and calls
 aborts, short transfers, oversize images, queue overflow, write failures,
 invalid images, and hash mismatches leave the currently running app selected.
 
-Rollback is enabled in `sdkconfig.defaults`. The startup path confirms a pending image with `esp_ota_mark_app_valid_cancel_rollback()` after basic initialization. Future application firmware that uses this OTA layer should call the same API as early as possible after its own startup checks; an unconfirmed new OTA image can be rolled back by the ESP-IDF bootloader after a failed first boot.
+Two-slot OTA rollback is enabled in `sdkconfig.defaults`. The startup path confirms a pending image with `esp_ota_mark_app_valid_cancel_rollback()` after basic initialization. This rollback is separate from the eFuse anti-rollback feature, which remains disabled. Future application firmware that uses this OTA layer should call the same API as early as possible after its own startup checks; an unconfirmed new OTA image can be rolled back by the ESP-IDF bootloader after a failed first boot.
 
 SHA-256 provides transfer integrity while the Ed25519 signature provides
 publisher authenticity. The release public key is supplied as
@@ -89,6 +105,22 @@ ESP-IDF/Arduino firmware as `LUDANT_OTA_PUBLIC_KEY_DER_HEX`, and inject
 commit the private key or send bootloader, partition-table, or OTA-data
 binaries.
 
+### Release open ESP-IDF firmware
+
+Product ESP-IDF releases are built with Secure Boot, flash encryption, and
+eFuse anti-rollback disabled. Release signing here means the Ludant BLE package
+signature only; no hardware Secure Boot key is required. From the workspace
+root, use:
+
+```sh
+LUDANT_OTA_SIGNING_KEY_FILE="$HOME/.config/ludant/keys/ota-ed25519-private.pem" \
+npm run firmware:bump:patch
+```
+
+Use the minor or major bump command when appropriate. To build a specific
+version, run `npm run firmware:release -- 2.1.0`. Both paths produce an
+unlocked USB flash image while retaining signed BLE OTA packages.
+
 ### Increment and release an Arduino version
 
 The workspace includes a guarded release command that increments the current
@@ -97,8 +129,7 @@ image, creates the signed `.ludantfirmware` package in the iOS resource folder,
 and updates `FirmwareCatalog.json`:
 
 ```sh
-LUDANT_OTA_SIGNING_KEY_FILE="$HOME/.config/ludant/ota-ed25519-private.pem" \
-npm run firmware:release -- patch
+npm run firmware:release:arduino -- patch
 ```
 
 Use `minor` or `major` instead of `patch` when appropriate. Add `--dry-run` to
@@ -110,7 +141,7 @@ Ed25519 release key; the private key is never written to the repository.
 
 ## Manual test
 
-1. Hold BOOT while flashing the initial factory image over USB.
+1. Install the open firmware over USB with `npm run firmware:install` (hold BOOT while resetting if the board needs ROM download mode).
 2. Open the serial monitor and confirm `Ludant` is advertising.
 3. Use a BLE inspector to discover service `7A910000-4C5E-4A9B-8F23-91F4A7D10000`.
 4. Enable notifications on Status and read Device Info.

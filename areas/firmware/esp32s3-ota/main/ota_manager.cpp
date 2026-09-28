@@ -18,7 +18,7 @@ constexpr uint32_t kProgressInterval = 4U * 1024U;
 
 OtaManager::OtaManager(OtaPermission& permission, const DeviceInfo& device_info)
     : permission_(permission), device_info_(device_info) {
-    mbedtls_sha256_init(&sha_context_);
+    mbedtls_md_init(&sha_context_);
     state_mutex_ = xSemaphoreCreateMutex();
     data_queue_ = xQueueCreate(kDataQueueCapacity, sizeof(DataChunk));
     recordCurrentVersion();
@@ -244,9 +244,10 @@ bool OtaManager::begin(uint32_t image_size, const char* expected_sha256, const c
     handle_valid_ = true;
     active_ = true;
 
-    mbedtls_sha256_free(&sha_context_);
-    mbedtls_sha256_init(&sha_context_);
-    if (mbedtls_sha256_starts_ret(&sha_context_, 0) != 0) {
+    mbedtls_md_free(&sha_context_);
+    mbedtls_md_init(&sha_context_);
+    if (mbedtls_md_setup(&sha_context_, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0) != 0 ||
+        mbedtls_md_starts(&sha_context_) != 0) {
         abort("SHA initialization failed");
         return false;
     }
@@ -299,7 +300,7 @@ bool OtaManager::commitData(const uint8_t* data, size_t length) {
         reportError("WRITE_FAILED", esp_err_to_name(ota_err));
         return false;
     }
-    if (mbedtls_sha256_update_ret(&sha_context_, data, length) != 0) {
+    if (mbedtls_md_update(&sha_context_, data, length) != 0) {
         abort("SHA update failed", false);
         reportError("WRITE_FAILED", "SHA update failed");
         return false;
@@ -313,7 +314,9 @@ bool OtaManager::commitData(const uint8_t* data, size_t length) {
     const bool queue_drained = data_queue_ == nullptr || uxQueueMessagesWaiting(data_queue_) == 0;
     if (received_bytes_ >= next_progress_report_ || queue_drained || received_bytes_ == expected_bytes_) {
         char message[64]{};
-        std::snprintf(message, sizeof(message), "PROGRESS:%u:%u", received_bytes_, expected_bytes_);
+        std::snprintf(message, sizeof(message), "PROGRESS:%u:%u",
+                      static_cast<unsigned>(received_bytes_),
+                      static_cast<unsigned>(expected_bytes_));
         ESP_LOGI(TAG, "%s", message);
         report(message);
         const uint32_t remaining = expected_bytes_ - received_bytes_;
@@ -369,7 +372,7 @@ bool OtaManager::finish() {
     }
 
     uint8_t digest[32]{};
-    if (mbedtls_sha256_finish_ret(&sha_context_, digest) != 0) {
+    if (mbedtls_md_finish(&sha_context_, digest) != 0) {
         clearState();
         reportError("SHA_FINALIZE", "could not finalize SHA-256");
         return false;
@@ -397,7 +400,7 @@ bool OtaManager::finish() {
     active_ = false;
     destination_ = nullptr;
     if (sha_initialized_) {
-        mbedtls_sha256_free(&sha_context_);
+        mbedtls_md_free(&sha_context_);
         sha_initialized_ = false;
     }
     report("SUCCESS");
@@ -447,8 +450,8 @@ void OtaManager::clearState() {
     if (data_queue_ != nullptr) xQueueReset(data_queue_);
     std::memset(expected_digest_, 0, sizeof(expected_digest_));
     if (sha_initialized_) {
-        mbedtls_sha256_free(&sha_context_);
-        mbedtls_sha256_init(&sha_context_);
+        mbedtls_md_free(&sha_context_);
+        mbedtls_md_init(&sha_context_);
         sha_initialized_ = false;
     }
 }

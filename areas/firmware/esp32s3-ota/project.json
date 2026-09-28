@@ -4,6 +4,13 @@
   "projectType": "application",
   "sourceRoot": "areas/firmware/esp32s3-ota/main",
   "targets": {
+    "test-safety": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "node --test tools/install-esp-idf-firmware-utils.test.mjs tools/unlocked-firmware-safety.test.mjs",
+        "cwd": "{projectRoot}"
+      }
+    },
     "set-target": {
       "executor": "nx:run-commands",
       "options": {
@@ -21,7 +28,7 @@
     "flash": {
       "executor": "nx:run-commands",
       "options": {
-        "command": "idf.py flash",
+        "command": ". \"$HOME/esp/esp-idf/export.sh\" >/dev/null && node tools/flash-unlocked-firmware.mjs",
         "cwd": "{projectRoot}"
       }
     },
@@ -35,7 +42,7 @@
     "flash-monitor": {
       "executor": "nx:run-commands",
       "options": {
-        "command": "idf.py flash monitor",
+        "command": ". \"$HOME/esp/esp-idf/export.sh\" >/dev/null && node tools/flash-unlocked-firmware.mjs --monitor",
         "cwd": "{projectRoot}"
       }
     }

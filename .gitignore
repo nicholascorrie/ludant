@@ -57,3 +57,4 @@ apps/ui/ludant-ios/**/DerivedData/
 areas/firmware/esp32s3-ota/sdkconfig
 areas/firmware/esp32s3-ota/sdkconfig.old
 areas/firmware/esp32s3-ota/dependencies.lock
+areas/firmware/esp32s3-ota/managed_components

@@ -6,6 +6,7 @@
 
 #include "device_info.hpp"
 #include "../shared/telemetry_frame.hpp"
+#include "esp_adc/adc_oneshot.h"
 
 using ModuleOutputCallback = void (*)(const char* message, void* context);
 using ModuleTelemetryCallback = void (*)(const ludant::BinaryTelemetryPacket& packet, void* context);
@@ -60,4 +61,5 @@ private:
     bool binary_telemetry_enabled_{false};
     uint32_t telemetry_sequence_{0};
     std::string migration_error_;
+    adc_oneshot_unit_handle_t adc_handle_{nullptr};
 };

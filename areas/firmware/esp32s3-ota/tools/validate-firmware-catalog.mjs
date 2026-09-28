@@ -10,6 +10,7 @@ const assetsRoot = path.join(root, 'apps/ui/ludant-ios/ludant-ios');
 const projectPath = path.join(root, 'apps/ui/ludant-ios/ludant-ios.xcodeproj/project.pbxproj');
 const otaSlotSize = 1_310_720;
 const versionPattern = /(?:^|-)(\d+)\.(\d+)\.(\d+)$/;
+const xcodeProject = fs.readFileSync(projectPath, 'utf8');
 
 function fail(message) {
   throw new Error(message);
@@ -25,6 +26,32 @@ function compareVersions(left, right) {
   const b = versionParts(right);
   if (!a || !b) return 0;
   return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+}
+
+function assertPackageIsBundled(packageName) {
+  const lines = xcodeProject.split('\n');
+  const fileReferenceLine = lines.find((line) =>
+    line.includes(`/* ${packageName} */ = {isa = PBXFileReference;`) &&
+    line.includes(`path = "ludant-ios/FirmwareAssets/${packageName}"`)
+  );
+  const fileReferenceId = fileReferenceLine?.match(/^\s*([A-F0-9]{24})/)?.[1];
+  if (!fileReferenceId) fail(`Xcode project has no folder reference for ${packageName}`);
+
+  const buildFileLine = lines.find((line) =>
+    line.includes(`/* ${packageName} in Resources */ = {isa = PBXBuildFile;`) &&
+    line.includes(`fileRef = ${fileReferenceId} /* ${packageName} */;`)
+  );
+  const buildFileId = buildFileLine?.match(/^\s*([A-F0-9]{24})/)?.[1];
+  if (!buildFileId) fail(`Xcode project does not copy ${packageName} as an app resource`);
+
+  const resourcesStart = xcodeProject.indexOf('/* Begin PBXResourcesBuildPhase section */');
+  const resourcesEnd = xcodeProject.indexOf('/* End PBXResourcesBuildPhase section */', resourcesStart);
+  const resources = resourcesStart >= 0 && resourcesEnd > resourcesStart
+    ? xcodeProject.slice(resourcesStart, resourcesEnd)
+    : '';
+  if (!resources.includes(`${buildFileId} /* ${packageName} in Resources */`)) {
+    fail(`Xcode app Resources phase omits ${packageName}`);
+  }
 }
 
 function publicKey() {
@@ -57,6 +84,7 @@ for (const release of releases) {
   const packagePath = path.resolve(assetsRoot, release.asset);
   if (!packagePath.startsWith(`${assetsRoot}${path.sep}`)) fail(`asset escapes resource root: ${release.asset}`);
   if (!fs.statSync(packagePath, { throwIfNoEntry: false })?.isDirectory()) fail(`missing package: ${release.asset}`);
+  assertPackageIsBundled(path.basename(packagePath));
   const manifestPath = path.join(packagePath, 'manifest.json');
   const binaryPath = path.join(packagePath, 'firmware.bin');
   if (!fs.existsSync(manifestPath) || !fs.existsSync(binaryPath)) fail(`incomplete package: ${release.asset}`);
@@ -77,13 +105,15 @@ for (const release of releases) {
   if (!['esp-idf', 'arduino'].includes(manifest.runtime ?? 'arduino')) fail(`unsupported runtime: ${release.version}`);
   const secureVersion = manifest.secureVersion === undefined ? 0 : manifest.secureVersion;
   if (!Number.isSafeInteger(secureVersion) || secureVersion < 0) fail(`invalid secure version: ${release.version}`);
+  if (manifest.secureVersion !== undefined) {
+    if (secureVersion < previousSecureVersion) fail(`secure version regressed: ${release.version}`);
+    previousSecureVersion = secureVersion;
+  }
   if (manifest.runtime === 'esp-idf' &&
       (!manifest.moduleImplementations || typeof manifest.moduleImplementations !== 'object' ||
        !manifest.moduleSchemas || typeof manifest.moduleSchemas !== 'object')) {
     fail(`ESP-IDF package is missing module metadata: ${release.version}`);
   }
-  if (secureVersion < previousSecureVersion) fail(`secure version regressed: ${release.version}`);
-  previousSecureVersion = secureVersion;
   if (manifest.runtime !== 'esp-idf') console.warn(`warning: legacy runtime package ${release.version}`);
 }
 
@@ -95,7 +125,11 @@ if (process.env.LUDANT_REQUIRE_ESPIDF === '1') {
   if (legacy.length > 0) fail(`production catalog contains legacy runtime packages: ${legacy.map((release) => release.version).join(', ')}`);
 }
 
-const latestVersion = catalog.latest?.version ?? releases.at(-1).version;
-if (!releases.some((release) => release.version === latestVersion)) fail(`catalog latest version does not resolve to an artifact: ${latestVersion}`);
+if (!catalog.latest || typeof catalog.latest.version !== 'string' || typeof catalog.latest.asset !== 'string') {
+  fail('catalog latest pointer must include version and asset');
+}
+const latestRelease = releases.find((release) => release.version === catalog.latest.version);
+if (!latestRelease) fail(`catalog latest version does not resolve to an artifact: ${catalog.latest.version}`);
+if (latestRelease.asset !== catalog.latest.asset) fail(`catalog latest asset does not match release ${catalog.latest.version}`);
 
-console.log(`Validated ${releases.length} firmware package(s); latest=${latestVersion}`);
+console.log(`Validated ${releases.length} firmware package(s); latest=${catalog.latest.version}`);

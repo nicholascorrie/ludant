@@ -7,5 +7,7 @@ idf_component_register(
         "device_info.cpp"
         "module_manager.cpp"
     INCLUDE_DIRS "."
-    REQUIRES app_update bt driver esp_timer json mbedtls nvs_flash
+    REQUIRES app_update bt driver esp_adc esp_timer esp_system mbedtls nvs_flash
 )
+
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=missing-field-initializers)

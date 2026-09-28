@@ -52,7 +52,7 @@ held, then reports `AUTHORIZATION_READY`. This is a preflight hint only;
 ```
 
 The ESP32 validates authorization, product, hardware, OTA protocol, version,
-anti-rollback floor, signature, image size, and inactive partition before
+signature, image size, and inactive partition before
 preparing the target. It reports `READY` only after preparation succeeds.
 Preparation may emit `PREPARING` first.
 
@@ -94,7 +94,9 @@ before sending `END`.
 
 ## Status messages and errors
 
-OTA statuses remain plain UTF-8 strings:
+Status notifications carry logical UTF-8 messages using the `F2` framing
+described below. The payload after reassembly is one of these OTA strings, a
+controller JSON response, or legacy JSON telemetry:
 
 ```text
 PREPARING
@@ -124,6 +126,24 @@ write failures, disconnect aborts, reset reason, and watchdog/startup health
 information. These diagnostics stay out of the short status vocabulary so the
 OTA state machine remains stable.
 
+### Status notification framing
+
+Every status notification is one ASCII `F2` frame with this 16-byte header
+followed by a UTF-8 payload chunk:
+
+```text
+F2 | messageId(2 base36) | chunkIndex(2 base36) | chunkCount(3 base36) |
+payloadLength(3 base36) | crc16(4 uppercase hex) | payload
+```
+
+The CRC is CRC-16/IBM (initial value `0xFFFF`, reflected polynomial
+`0xA001`) over the complete reassembled payload. Frames are ordered and
+payload chunks must not split a UTF-8 code point. Senders size frames to the
+negotiated ATT MTU; at the minimum MTU of 23 bytes, each frame carries up to
+four payload bytes. Receivers must validate the header, count, byte length, and
+CRC before parsing or delivering the message. A logical status payload is
+limited to 2048 bytes.
+
 ## Firmware artifact package
 
 The iOS Files picker accepts a `.ludantfirmware` directory package containing
@@ -140,19 +160,26 @@ Device Info reports at least:
 
 ```json
 {
-  "device":"electronics-controller",
-  "chip":"ESP32-S3",
   "hardware":"ESP32-S3",
-  "firmware":"arduino-modules-2.0.0",
+  "runtime":"esp-idf",
+  "secureVersion":0,
+  "moduleSchemas":{"sensor.mpu6050":1,"sensor.bme280":1,"sensor.soil-moisture":1,"actuator.relay":1},
+  "firmware":"2.0.0",
   "otaProtocol":2,
   "supportsOTA":true,
   "otaCapabilities":["signed","sha256","rollback","sequential_write_with_response","sequential_write_without_response"],
   "protocolVersion":2,
   "otaAuthorization":"physical_button",
   "bootVersion":"1.0.0",
-  "otaMaxImageSize":1310720
+  "otaMaxImageSize":1310720,
+  "deviceId":"device-identity"
 }
 ```
+
+Keep Device Info within the 512-byte maximum GATT attribute-value size. Fields
+available from `get_state` or not required for connection/update compatibility
+(for example the friendly name and module implementation-version map) belong
+in the controller state response, not this read characteristic.
 
 ## Reboot and rollback
 

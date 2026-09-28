@@ -9,7 +9,6 @@
 
 #include "bme280_compensation.hpp"
 #include "cJSON.h"
-#include "driver/adc.h"
 #include "driver/gpio.h"
 #include "driver/i2c.h"
 #include "esp_log.h"
@@ -105,16 +104,16 @@ void addCapability(cJSON* array, const char* driver) {
 
 int adcChannelForGpio(int gpio) {
     switch (gpio) {
-    case 1: return ADC1_CHANNEL_0;
-    case 2: return ADC1_CHANNEL_1;
-    case 3: return ADC1_CHANNEL_2;
-    case 4: return ADC1_CHANNEL_3;
-    case 5: return ADC1_CHANNEL_4;
-    case 6: return ADC1_CHANNEL_5;
-    case 7: return ADC1_CHANNEL_6;
-    case 8: return ADC1_CHANNEL_7;
-    case 9: return ADC1_CHANNEL_8;
-    case 10: return ADC1_CHANNEL_9;
+    case 1: return ADC_CHANNEL_0;
+    case 2: return ADC_CHANNEL_1;
+    case 3: return ADC_CHANNEL_2;
+    case 4: return ADC_CHANNEL_3;
+    case 5: return ADC_CHANNEL_4;
+    case 6: return ADC_CHANNEL_5;
+    case 7: return ADC_CHANNEL_6;
+    case 8: return ADC_CHANNEL_7;
+    case 9: return ADC_CHANNEL_8;
+    case 10: return ADC_CHANNEL_9;
     default: return -1;
     }
 }
@@ -156,7 +155,10 @@ void decodeBME280Calibration(const uint8_t* temperature_pressure,
 
 ModuleManager::ModuleManager(const DeviceInfo& device_info) : device_info_(device_info) {}
 
-ModuleManager::~ModuleManager() { stopTelemetry(); }
+ModuleManager::~ModuleManager() {
+    stopTelemetry();
+    if (adc_handle_ != nullptr) adc_oneshot_del_unit(adc_handle_);
+}
 
 void ModuleManager::setOutputCallback(ModuleOutputCallback callback, void* context) {
     output_callback_ = callback;
@@ -169,6 +171,9 @@ void ModuleManager::setTelemetryCallback(ModuleTelemetryCallback callback, void*
 }
 
 bool ModuleManager::begin() {
+    adc_oneshot_unit_init_cfg_t init_config{};
+    init_config.unit_id = ADC_UNIT_1;
+    if (adc_oneshot_new_unit(&init_config, &adc_handle_) != ESP_OK) adc_handle_ = nullptr;
     return loadPersistedModules();
 }
 
@@ -495,8 +500,9 @@ bool ModuleManager::handleCommand(const char* message, size_t length) {
     } else if (std::strcmp(command, "remove_module") == 0) {
         const char* instance_id = stringItem(root, "instanceId");
         cJSON* modules = cJSON_Parse(modules_json_.c_str());
+        cJSON* item = nullptr;
         for (int index = cJSON_GetArraySize(modules) - 1; index >= 0; --index) {
-            cJSON* item = cJSON_GetArrayItem(modules, index);
+            item = cJSON_GetArrayItem(modules, index);
             const char* existing_id = stringItem(item, "instanceId");
             if (instance_id != nullptr && existing_id != nullptr && std::strcmp(existing_id, instance_id) == 0) cJSON_DeleteItemFromArray(modules, index);
             }
@@ -579,7 +585,15 @@ void ModuleManager::emitTelemetry() {
     if (std::strcmp(plugin == nullptr ? "" : plugin, "actuator.relay") == 0) addValue("state", parameterValue(module, "state", 0));
     else if (std::strcmp(plugin == nullptr ? "" : plugin, "sensor.soil-moisture") == 0) {
         int channel = adcChannelForGpio(pinValue(module, "signal"));
-        int raw = channel < 0 ? 0 : adc1_get_raw(static_cast<adc1_channel_t>(channel));
+        int raw = 0;
+        if (channel >= 0 && adc_handle_ != nullptr) {
+            adc_oneshot_chan_cfg_t config{};
+            config.atten = ADC_ATTEN_DB_12;
+            config.bitwidth = ADC_BITWIDTH_DEFAULT;
+            if (adc_oneshot_config_channel(adc_handle_, static_cast<adc_channel_t>(channel), &config) == ESP_OK) {
+                adc_oneshot_read(adc_handle_, static_cast<adc_channel_t>(channel), &raw);
+            }
+        }
         int dry = parameterValue(module, "dryValue", 3200); int wet = parameterValue(module, "wetValue", 1400);
         double moisture = dry == wet ? 0.0 : std::clamp(100.0 * (dry - raw) / static_cast<double>(dry - wet), 0.0, 100.0);
         addValue("moisture", moisture);

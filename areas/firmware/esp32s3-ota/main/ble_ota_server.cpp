@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <vector>
 
 #include "cJSON.h"
@@ -20,6 +21,8 @@
 #include "services/gatt/ble_svc_gatt.h"
 #include "store/config/ble_store_config.h"
 
+extern "C" void ble_store_config_init(void);
+
 namespace {
 constexpr char TAG[] = "ble_ota";
 // Keep the complete service UUID and the name inside the legacy 31-byte
@@ -27,6 +30,9 @@ constexpr char TAG[] = "ble_ota";
 constexpr char kDeviceName[] = "Ludant";
 constexpr size_t kMaxControlJson = 8192;
 constexpr size_t kMaxFramedControlJson = 2047;
+constexpr size_t kStatusFrameHeaderLength = 16;
+constexpr size_t kStatusFrameMaximumLength = 517;
+constexpr size_t kMaxGattAttributeValueLength = 512;
 // Keep the server-side copy bounded to the same size accepted by the OTA
 // manager's queue. This prevents a large ATT write from being split into a
 // callback-sized buffer that the manager would reject.
@@ -62,6 +68,10 @@ static uint16_t data_handle = 0;
 static uint16_t status_handle = 0;
 static uint16_t device_info_handle = 0;
 static uint16_t telemetry_handle = 0;
+
+uint16_t crc16Bytes(const uint8_t* data, size_t length);
+void writeBase36(char* destination, size_t width, uint32_t value);
+size_t utf8SafeChunkLength(const char* message, size_t offset, size_t remaining, size_t capacity);
 
 static int accessCallback(uint16_t conn_handle, uint16_t attr_handle,
                           struct ble_gatt_access_ctxt* ctxt, void* arg) {
@@ -130,7 +140,10 @@ esp_err_t BleOtaServer::start() {
         return ESP_ERR_NO_MEM;
     }
     telemetry_queue_ = xQueueCreate(16, sizeof(ludant::BinaryTelemetryPacket));
-    if (telemetry_queue_ == nullptr || xTaskCreate(telemetryTask, "ludant_binary_telemetry", 3072, this, 4, &telemetry_task_) != pdPASS) {
+    status_queue_ = xQueueCreate(4, sizeof(QueuedStatus*));
+    if (telemetry_queue_ == nullptr || status_queue_ == nullptr ||
+        xTaskCreate(telemetryTask, "ludant_binary_telemetry", 3072, this, 4, &telemetry_task_) != pdPASS ||
+        xTaskCreate(statusTask, "ludant_ble_status", 4096, this, 5, &status_task_) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     const esp_err_t nimble_err = nimble_port_init();
@@ -182,6 +195,23 @@ void BleOtaServer::moduleCallback(const char* message, void* context) {
 
 void BleOtaServer::telemetryCallback(const ludant::BinaryTelemetryPacket& packet, void* context) {
     static_cast<BleOtaServer*>(context)->notifyTelemetry(packet);
+}
+
+void BleOtaServer::statusTask(void* argument) {
+    auto* server = static_cast<BleOtaServer*>(argument);
+    QueuedStatus* status = nullptr;
+    while (true) {
+        if (server->status_queue_ == nullptr ||
+            xQueueReceive(server->status_queue_, &status, portMAX_DELAY) != pdTRUE || status == nullptr) {
+            continue;
+        }
+        if (server->status_notifications_enabled_ &&
+            status->connection_handle == server->connection_handle_) {
+            server->transmitStatus(*status);
+        }
+        delete status;
+        status = nullptr;
+    }
 }
 
 void BleOtaServer::telemetryTask(void* argument) {
@@ -247,7 +277,21 @@ void BleOtaServer::handleStatus(const char* message) {
     if (message == nullptr) {
         return;
     }
-    std::strncpy(last_status_, message, sizeof(last_status_) - 1);
+    const size_t message_length = std::strlen(message);
+    const size_t saved_length = std::min(message_length, sizeof(last_status_) - 1);
+    if (message_length < sizeof(last_status_)) {
+        std::memcpy(last_status_, message, saved_length);
+        last_status_[saved_length] = '\0';
+    } else {
+        // Do not replay a truncated JSON response to a reconnecting client.
+        std::strncpy(last_status_, "RESPONSE_AVAILABLE", sizeof(last_status_) - 1);
+        last_status_[sizeof(last_status_) - 1] = '\0';
+    }
+    if (message_length > kMaxStatusMessageLength) {
+        ESP_LOGE(TAG, "Status message exceeds framing limit: bytes=%u maximum=%u",
+                 static_cast<unsigned>(message_length), static_cast<unsigned>(kMaxStatusMessageLength));
+        return;
+    }
     notifyStatus(message);
     if (std::strcmp(message, "SUCCESS") == 0) {
         scheduleRestart();
@@ -255,20 +299,104 @@ void BleOtaServer::handleStatus(const char* message) {
 }
 
 void BleOtaServer::notifyStatus(const char* message) {
-    if (!status_notifications_enabled_ || connection_handle_ == BLE_HS_CONN_HANDLE_NONE) {
+    if (message == nullptr || !status_notifications_enabled_ ||
+        connection_handle_ == BLE_HS_CONN_HANDLE_NONE || status_queue_ == nullptr) {
         return;
     }
 
     const size_t message_length = std::strlen(message);
-    struct os_mbuf* buffer = ble_hs_mbuf_from_flat(message, message_length);
-    if (buffer == nullptr) {
-        ESP_LOGE(TAG, "Could not allocate notification buffer");
+    if (message_length == 0 || message_length > kMaxStatusMessageLength) {
+        ESP_LOGE(TAG, "Cannot queue status notification: bytes=%u maximum=%u",
+                 static_cast<unsigned>(message_length), static_cast<unsigned>(kMaxStatusMessageLength));
         return;
     }
 
-    const int rc = ble_gatts_notify_custom(connection_handle_, status_handle, buffer);
-    if (rc != 0) {
-        ESP_LOGW(TAG, "Status notification failed: %d", rc);
+    auto* status = new (std::nothrow) QueuedStatus{};
+    if (status == nullptr) {
+        ESP_LOGE(TAG, "Could not allocate status notification");
+        return;
+    }
+    status->connection_handle = connection_handle_;
+    status->length = message_length;
+    std::memcpy(status->data, message, message_length);
+    status->data[message_length] = '\0';
+    if (xQueueSend(status_queue_, &status, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Status notification queue is full; dropping message bytes=%u",
+                 static_cast<unsigned>(message_length));
+        delete status;
+    }
+}
+
+void BleOtaServer::transmitStatus(const QueuedStatus& status) {
+    if (status.length == 0 || status.length > kMaxStatusMessageLength) return;
+
+    const uint16_t mtu = ble_att_mtu(status.connection_handle);
+    if (mtu <= 3 + kStatusFrameHeaderLength) {
+        ESP_LOGW(TAG, "BLE MTU too small for status framing: mtu=%u", mtu);
+        return;
+    }
+    const size_t payload_capacity = std::min<size_t>(
+        mtu - 3 - kStatusFrameHeaderLength,
+        kStatusFrameMaximumLength - kStatusFrameHeaderLength);
+
+    uint32_t total_chunks = 0;
+    for (size_t offset = 0; offset < status.length; ++total_chunks) {
+        const size_t chunk_length = utf8SafeChunkLength(
+            status.data, offset, status.length - offset, payload_capacity);
+        if (chunk_length == 0) {
+            ESP_LOGE(TAG, "Could not split status at a UTF-8 boundary: offset=%u",
+                     static_cast<unsigned>(offset));
+            return;
+        }
+        offset += chunk_length;
+    }
+
+    const uint16_t message_id = next_status_message_id_;
+    next_status_message_id_ = static_cast<uint16_t>((next_status_message_id_ + 1) % (36 * 36));
+    const uint16_t checksum = crc16Bytes(
+        reinterpret_cast<const uint8_t*>(status.data), status.length);
+    size_t offset = 0;
+    uint32_t index = 0;
+    while (offset < status.length) {
+        if (!status_notifications_enabled_ || connection_handle_ != status.connection_handle) return;
+
+        const size_t chunk_length = utf8SafeChunkLength(
+            status.data, offset, status.length - offset, payload_capacity);
+        char frame[kStatusFrameMaximumLength]{};
+        char message_id_text[3]{};
+        char index_text[3]{};
+        char total_text[4]{};
+        char length_text[4]{};
+        char checksum_text[5]{};
+        writeBase36(message_id_text, 2, message_id);
+        writeBase36(index_text, 2, index);
+        writeBase36(total_text, 3, total_chunks);
+        writeBase36(length_text, 3, static_cast<uint32_t>(status.length));
+        std::snprintf(checksum_text, sizeof(checksum_text), "%04X", checksum);
+        std::memcpy(frame, "F2", 2);
+        std::memcpy(frame + 2, message_id_text, 2);
+        std::memcpy(frame + 4, index_text, 2);
+        std::memcpy(frame + 6, total_text, 3);
+        std::memcpy(frame + 9, length_text, 3);
+        std::memcpy(frame + 12, checksum_text, 4);
+        std::memcpy(frame + kStatusFrameHeaderLength, status.data + offset, chunk_length);
+
+        const size_t frame_length = kStatusFrameHeaderLength + chunk_length;
+        struct os_mbuf* buffer = ble_hs_mbuf_from_flat(frame, frame_length);
+        if (buffer == nullptr) {
+            ESP_LOGE(TAG, "Could not allocate status frame: id=%u index=%u/%u",
+                     message_id, static_cast<unsigned>(index), static_cast<unsigned>(total_chunks));
+            return;
+        }
+        const int rc = ble_gatts_notify_custom(status.connection_handle, status_handle, buffer);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "Status frame notify failed: id=%u index=%u/%u rc=%d",
+                     message_id, static_cast<unsigned>(index), static_cast<unsigned>(total_chunks), rc);
+            return;
+        }
+        offset += chunk_length;
+        ++index;
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -284,6 +412,13 @@ void BleOtaServer::handleDisconnect() {
     status_notifications_enabled_ = false;
     telemetry_notifications_enabled_ = false;
     connection_handle_ = BLE_HS_CONN_HANDLE_NONE;
+    if (status_queue_ != nullptr) {
+        QueuedStatus* pending = nullptr;
+        while (xQueueReceive(status_queue_, &pending, 0) == pdTRUE) {
+            delete pending;
+            pending = nullptr;
+        }
+    }
     if (telemetry_queue_ != nullptr) xQueueReset(telemetry_queue_);
     ota_manager_.onDisconnect();
     module_manager_.stopTelemetry();
@@ -297,6 +432,13 @@ int BleOtaServer::handleRead(uint16_t attr_handle, struct ble_gatt_access_ctxt* 
         value = device_info_.json();
     } else {
         return BLE_ATT_ERR_READ_NOT_PERMITTED;
+    }
+
+    if (value.size() > kMaxGattAttributeValueLength) {
+        ESP_LOGE(TAG, "GATT read value exceeds attribute limit: handle=%u bytes=%u maximum=%u",
+                 attr_handle, static_cast<unsigned>(value.size()),
+                 static_cast<unsigned>(kMaxGattAttributeValueLength));
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
 
     return os_mbuf_append(ctxt->om, value.data(), value.size()) == 0
@@ -418,6 +560,24 @@ uint16_t crc16Bytes(const uint8_t* data, size_t length) {
         }
     }
     return crc;
+}
+
+void writeBase36(char* destination, size_t width, uint32_t value) {
+    static constexpr char digits[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    for (size_t index = width; index > 0; --index) {
+        destination[index - 1] = digits[value % 36];
+        value /= 36;
+    }
+    destination[width] = '\0';
+}
+
+size_t utf8SafeChunkLength(const char* message, size_t offset, size_t remaining, size_t capacity) {
+    size_t length = std::min(remaining, capacity);
+    while (length > 0 && offset + length < offset + remaining &&
+           (static_cast<uint8_t>(message[offset + length]) & 0xC0) == 0x80) {
+        --length;
+    }
+    return length;
 }
 }
 

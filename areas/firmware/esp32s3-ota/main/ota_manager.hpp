@@ -1,15 +1,15 @@
 #pragma once
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include <cstddef>
 #include <cstdint>
 
 #include "esp_err.h"
 #include "esp_ota_ops.h"
-#include "mbedtls/sha256.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
+#include "mbedtls/md.h"
 
 #include "ota_permission.hpp"
 #include "device_info.hpp"
@@ -56,7 +56,7 @@ private:
     void* status_context_{nullptr};
     esp_ota_handle_t ota_handle_{0};
     const esp_partition_t* destination_{nullptr};
-    mbedtls_sha256_context sha_context_{};
+    mbedtls_md_context_t sha_context_{};
     bool sha_initialized_{false};
     bool handle_valid_{false};
     bool active_{false};

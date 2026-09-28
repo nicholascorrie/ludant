@@ -5,6 +5,7 @@
 
 #include "esp_app_desc.h"
 #include "esp_ota_ops.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "nvs.h"
 
@@ -82,11 +83,9 @@ uint32_t DeviceInfo::otaMaxImageSize() const {
 }
 
 int DeviceInfo::secureVersion() const {
-#ifdef CONFIG_BOOTLOADER_APP_SECURE_VERSION
-    return CONFIG_BOOTLOADER_APP_SECURE_VERSION;
-#else
-    return CONFIG_LUDANT_SECURE_VERSION;
-#endif
+    // Kept in Device Info for protocol compatibility. Ludant releases do not
+    // use the eFuse anti-rollback counter, so open builds always report zero.
+    return 0;
 }
 
 std::string DeviceInfo::json() const {
@@ -94,13 +93,12 @@ std::string DeviceInfo::json() const {
 #if CONFIG_LUDANT_OTA_DEVELOPMENT_WINDOW
     ota_authorization = "physical_button_or_timed_window";
 #endif
-    return std::string("{\"device\":\"electronics-controller\",\"chip\":\"ESP32-S3\",\"hardware\":\"ESP32-S3\",\"runtime\":\"esp-idf\",\"secureVersion\":") +
+    return std::string("{\"hardware\":\"ESP32-S3\",\"runtime\":\"esp-idf\",\"secureVersion\":") +
         std::to_string(secureVersion()) +
-        ",\"moduleStateSchemaVersion\":1,\"moduleImplementations\":{\"sensor.mpu6050\":\"1.0.0\",\"sensor.bme280\":\"1.0.0\",\"sensor.soil-moisture\":\"1.0.0\",\"actuator.relay\":\"1.0.0\"},\"moduleSchemas\":{\"sensor.mpu6050\":1,\"sensor.bme280\":1,\"sensor.soil-moisture\":1,\"actuator.relay\":1},\"firmware\":\"") +
+        ",\"moduleSchemas\":{\"sensor.mpu6050\":1,\"sensor.bme280\":1,\"sensor.soil-moisture\":1,\"actuator.relay\":1},\"firmware\":\"" +
         escapeJson(firmwareVersion()) +
-        "\",\"otaProtocol\":2,\"protocolVersion\":2,\"supportsOTA\":true,\"otaCapabilities\":[\"signed\",\"sha256\",\"rollback\",\"sequential_write_with_response\",\"sequential_write_without_response\"],\"supportsModules\":true,\"otaAuthorization\":\"" + ota_authorization + "\",\"bootVersion\":\"" +
+        "\",\"otaProtocol\":2,\"protocolVersion\":2,\"supportsOTA\":true,\"otaCapabilities\":[\"signed\",\"sha256\",\"rollback\",\"sequential_write_with_response\",\"sequential_write_without_response\"],\"otaAuthorization\":\"" + ota_authorization + "\",\"bootVersion\":\"" +
         escapeJson(bootVersion()) +
         "\",\"otaMaxImageSize\":" + std::to_string(otaMaxImageSize()) +
-        ",\"deviceId\":\"" + escapeJson(device_id_.c_str()) +
-        "\",\"friendlyName\":\"" + escapeJson(friendly_name_.c_str()) + "\"}";
+        ",\"deviceId\":\"" + escapeJson(device_id_.c_str()) + "\"}";
 }
