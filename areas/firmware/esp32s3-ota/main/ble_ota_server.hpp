@@ -59,6 +59,7 @@ private:
     bool telemetry_notifications_enabled_{false};
     bool restart_pending_{false};
     SemaphoreHandle_t advertising_ready_{nullptr};
+    SemaphoreHandle_t status_mutex_{nullptr};
     char last_status_[160]{"IDLE"};
     static constexpr size_t kMaxStatusMessageLength = 2048;
     struct QueuedStatus {

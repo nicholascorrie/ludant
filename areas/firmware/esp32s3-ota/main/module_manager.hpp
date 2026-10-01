@@ -39,6 +39,8 @@ private:
     bool validatePins(void* module, const char** error) const;
     bool readModule(void* module, void* values) const;
     bool readI2C(int sda, int scl, int address, uint8_t reg, uint8_t* output, size_t length) const;
+    bool writeI2C(int sda, int scl, int address, uint8_t reg, uint8_t value) const;
+    bool waitForBME280Conversion(int sda, int scl, int address) const;
     bool configureRelay(void* module) const;
     int pinValue(void* module, const char* name) const;
     int parameterValue(void* module, const char* name, int fallback) const;

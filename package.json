@@ -9,6 +9,7 @@
     "firmware:install": ". \"$HOME/esp/esp-idf/export.sh\" >/dev/null && node areas/firmware/esp32s3-ota/tools/install-esp-idf-firmware.mjs",
     "firmware:flash:unlocked": ". \"$HOME/esp/esp-idf/export.sh\" >/dev/null && node areas/firmware/esp32s3-ota/tools/flash-unlocked-firmware.mjs",
     "firmware:test:installer": "node --test areas/firmware/esp32s3-ota/tools/install-esp-idf-firmware-utils.test.mjs areas/firmware/esp32s3-ota/tools/unlocked-firmware-safety.test.mjs",
+    "firmware:test:usb-package": "node --test areas/firmware/esp32s3-ota/tools/create-usb-flash-package.test.mjs areas/firmware/esp32s3-ota/tools/usb-flash-asset-transaction.test.mjs",
     "firmware:next": "node areas/firmware/esp32s3-ota/tools/firmware-release-command.mjs next",
     "firmware:bump:patch": ". \"$HOME/esp/esp-idf/export.sh\" >/dev/null && LUDANT_OTA_SIGNING_KEY_FILE=$HOME/.config/ludant/keys/ota-ed25519-private.pem node areas/firmware/esp32s3-ota/tools/firmware-release-command.mjs bump patch",
     "firmware:bump:minor": ". \"$HOME/esp/esp-idf/export.sh\" >/dev/null && LUDANT_OTA_SIGNING_KEY_FILE=$HOME/.config/ludant/keys/ota-ed25519-private.pem node areas/firmware/esp32s3-ota/tools/firmware-release-command.mjs bump minor",

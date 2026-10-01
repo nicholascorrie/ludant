@@ -1,0 +1,41 @@
+{
+  "formatVersion": 1,
+  "product": "ludant-esp32s3",
+  "hardware": "ESP32-S3",
+  "firmwareVersion": "2.0.45",
+  "chip": "esp32s3",
+  "image": "ludant-2.0.45.bin",
+  "imageSize": 4194304,
+  "imageSha256": "0bc02f0e15357b023c25cfa954818a6f6260a866c1c0e8e28abcf7c3d9c417b3",
+  "flashSettings": {
+    "flash_mode": "dio",
+    "flash_size": "4MB",
+    "flash_freq": "80m"
+  },
+  "sourceImages": [
+    {
+      "offset": "0x0",
+      "path": "images/bootloader.bin",
+      "size": 20464,
+      "sha256": "960c21f15e1fba0ded8eb23bd4101c32bc04d5615711c8f64cd745ab649cec8d"
+    },
+    {
+      "offset": "0x10000",
+      "path": "images/partition-table.bin",
+      "size": 3072,
+      "sha256": "299d38e793a6606c1c3f8e82e0c1de1cb2c5919618509c77693601a3a859a6e3"
+    },
+    {
+      "offset": "0x17000",
+      "path": "images/ota_data_initial.bin",
+      "size": 8192,
+      "sha256": "7d2c7ac4888bfd75cd5f56e8d61f69595121183afc81556c876732fd3782c62f"
+    },
+    {
+      "offset": "0x120000",
+      "path": "images/ludant_esp32s3_ota.bin",
+      "size": 719504,
+      "sha256": "ebfbffc92ce98aa83a0a5068e3a4fa2a90c0aef6873184f85cf05e3e3f705907"
+    }
+  ]
+}

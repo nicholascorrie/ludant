@@ -4,22 +4,59 @@
 #include "ota_permission.hpp"
 #include "module_manager.hpp"
 
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 namespace {
 constexpr char TAG[] = "ludant_main";
 
-void initializeNvs() {
+constexpr int64_t kNvsRecoveryBootHoldUs = 10LL * 1000LL * 1000LL;
+
+bool confirmNvsRecoveryWithBootButton() {
+    gpio_config_t config{};
+    config.pin_bit_mask = 1ULL << CONFIG_LUDANT_BOOT_BUTTON_GPIO;
+    config.mode = GPIO_MODE_INPUT;
+    config.pull_up_en = GPIO_PULLUP_ENABLE;
+    config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    config.intr_type = GPIO_INTR_DISABLE;
+    ESP_ERROR_CHECK(gpio_config(&config));
+
+    ESP_LOGE(TAG, "NVS recovery would erase all saved data and BLE bonds; hold BOOT continuously for 10 seconds to confirm");
+    const int64_t started_us = esp_timer_get_time();
+    while (esp_timer_get_time() - started_us < kNvsRecoveryBootHoldUs) {
+        if (gpio_get_level(static_cast<gpio_num_t>(CONFIG_LUDANT_BOOT_BUTTON_GPIO)) != 0) {
+            ESP_LOGE(TAG, "NVS recovery cancelled; saved BLE bonds were preserved");
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    ESP_LOGW(TAG, "Physical BOOT confirmation received for NVS recovery");
+    return true;
+}
+
+esp_err_t initializeNvs() {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_LOGE(TAG, "NVS recovery required (%s); automatic erase is disabled to preserve persisted NimBLE bonds",
+                 esp_err_to_name(err));
+        if (!confirmNvsRecoveryWithBootButton()) {
+            return err;
+        }
+        const esp_err_t erase_err = nvs_flash_erase();
+        if (erase_err != ESP_OK) {
+            return erase_err;
+        }
         err = nvs_flash_init();
     }
-    ESP_ERROR_CHECK(err);
+    return err;
 }
 
 void confirmRunningApplication() {
@@ -39,7 +76,12 @@ void confirmRunningApplication() {
 extern "C" void app_main() {
     ESP_LOGI(TAG, "Ludant ESP32-S3 firmware starting; version=%s; resetReason=%d",
         CONFIG_LUDANT_FIRMWARE_VERSION, static_cast<int>(esp_reset_reason()));
-    initializeNvs();
+    const esp_err_t nvs_err = initializeNvs();
+    if (nvs_err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS unavailable (%s); startup stopped without erasing saved BLE bonds. Hold BOOT for 10 seconds during startup to explicitly recover NVS",
+                 esp_err_to_name(nvs_err));
+        return;
+    }
 
     // These services are referenced by FreeRTOS tasks and NimBLE callbacks
     // after app_main returns. Keep them in static storage rather than on the

@@ -43,6 +43,35 @@ configuration and refuses to overwrite a board that already has Secure Boot or
 flash encryption enabled. Owners can erase and reflash an unlocked board with
 their own firmware using the standard ESP32-S3 USB ROM download tools.
 
+## Releasing firmware for first install and BLE updates
+
+Run `npm run firmware:bump:patch` (or `:minor` / `:major`) for an ESP-IDF
+release. The release command builds once, signs the BLE OTA package, and creates
+a matching `FirmwareAssets/<version>-usb.zip` from ESP-IDF's generated
+`build/flasher_args.json`. It also merges those same flash images into a browser
+flasher binary with an ESP Launchpad config under `docs/launchpad`. It validates
+all artifacts, updates the iOS firmware catalog and Xcode resources, and keeps
+only the latest USB ZIP and Launchpad image. Older signed BLE OTA packages
+remain available in the catalog. A failed release restores the previous
+catalog, Xcode project, OTA package, USB ZIP, and Launchpad files.
+
+The iOS controller setup offers a shareable ESP Launchpad link and the USB ZIP
+as a manual fallback. Open the link on a Mac or Windows computer in Chrome or
+Edge, connect the board over USB, and follow ESP Launchpad. GitHub Actions
+publishes `docs/launchpad` to GitHub Pages after the release is merged to `main`.
+The manual ZIP includes the build-generated flash offsets, checksums, a README,
+and macOS/Windows launch scripts; those scripts check flash capacity and read
+relevant eFuses before writing.
+
+Neither first-flash path burns eFuses or enables Secure Boot or flash encryption.
+Boards remain open for users to install other compatible firmware later. After
+flashing, leave the board powered on and return to Ludant to connect over
+Bluetooth.
+
+The ESP-IDF release command prepares the app assets but does not build or submit
+an App Store release. `npm run firmware:release:arduino` remains a separate
+Arduino release path and does not generate the USB first-install ZIP.
+
 Do not enable Secure Boot, flash encryption in development or release mode,
 secure UART/USB download mode, or app anti-rollback in a product build. Those
 features can change one-way eFuse state on first boot. Existing devices whose

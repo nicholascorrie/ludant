@@ -4,6 +4,17 @@
 
 namespace ludant {
 
+static constexpr int32_t kBME280SkippedPressureOrTemperature = 0x80000;
+static constexpr int32_t kBME280SkippedHumidity = 0x8000;
+
+inline bool bme280MeasurementsWereSkipped(int32_t raw_pressure,
+                                          int32_t raw_temperature,
+                                          int32_t raw_humidity) {
+    return raw_pressure == kBME280SkippedPressureOrTemperature ||
+           raw_temperature == kBME280SkippedPressureOrTemperature ||
+           raw_humidity == kBME280SkippedHumidity;
+}
+
 struct BME280Calibration {
     uint16_t dig_t1{0};
     int16_t dig_t2{0};

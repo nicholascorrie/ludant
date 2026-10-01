@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -415,6 +416,9 @@ void* ModuleManager::statePayload() const {
     cJSON_AddStringToObject(state, "deviceId", device_info_.deviceId());
     cJSON_AddStringToObject(state, "friendlyName", device_info_.friendlyName());
     cJSON_AddStringToObject(state, "firmwareVersion", device_info_.firmwareVersion());
+    // Device Info and command responses share the same BLE protocol version.
+    // The iOS state decoder intentionally treats a missing version as legacy v1.
+    cJSON_AddNumberToObject(state, "protocolVersion", 2);
     cJSON* capabilities = cJSON_CreateArray();
     addCapability(capabilities, "mpu6050");
     addCapability(capabilities, "bme280");
@@ -600,7 +604,15 @@ void ModuleManager::emitTelemetry() {
     } else if (std::strcmp(plugin == nullptr ? "" : plugin, "sensor.mpu6050") == 0) {
         uint8_t bytes[14]{};
         const int address = parameterValue(module, "address", 0x68);
-        if (readI2C(pinValue(module, "sda"), pinValue(module, "scl"), address, 0x3B, bytes, sizeof(bytes))) {
+        const int sda = pinValue(module, "sda");
+        const int scl = pinValue(module, "scl");
+        uint8_t who_am_i = 0;
+        if (!readI2C(sda, scl, address, 0x75, &who_am_i, sizeof(who_am_i)) ||
+            (who_am_i != 0x68 && who_am_i != 0x69 && who_am_i != 0x70)) {
+            setError("MPU6050 identity check failed");
+        } else if (!writeI2C(sda, scl, address, 0x6B, 0x00)) {
+            setError("MPU6050 wake failed");
+        } else if (readI2C(sda, scl, address, 0x3B, bytes, sizeof(bytes))) {
             auto signedValue = [&bytes](size_t index) { return static_cast<int16_t>((static_cast<uint16_t>(bytes[index]) << 8) | bytes[index + 1]); };
             const double accel_x = signedValue(0) / 16384.0;
             const double accel_y = signedValue(2) / 16384.0;
@@ -624,35 +636,54 @@ void ModuleManager::emitTelemetry() {
         uint8_t temperature_pressure_calibration[24]{};
         uint8_t humidity_calibration[7]{};
         const int address = parameterValue(module, "address", 0x76);
+        const int sda = pinValue(module, "sda");
+        const int scl = pinValue(module, "scl");
+        uint8_t chip_id = 0;
         uint8_t humidity_one = 0;
-        const bool calibration_read =
-            readI2C(pinValue(module, "sda"), pinValue(module, "scl"), address, 0x88,
-                    temperature_pressure_calibration, sizeof(temperature_pressure_calibration)) &&
-            readI2C(pinValue(module, "sda"), pinValue(module, "scl"), address, 0xE1,
-                    humidity_calibration, sizeof(humidity_calibration)) &&
-            readI2C(pinValue(module, "sda"), pinValue(module, "scl"), address, 0xA1,
-                    &humidity_one, 1);
-        if (calibration_read &&
-            readI2C(pinValue(module, "sda"), pinValue(module, "scl"), address, 0xF7, bytes, sizeof(bytes))) {
+        const bool identified = readI2C(sda, scl, address, 0xD0, &chip_id, sizeof(chip_id)) && chip_id == 0x60;
+        if (!identified) {
+            setError("BME280 chip ID mismatch");
+        } else if (!readI2C(sda, scl, address, 0x88,
+                            temperature_pressure_calibration, sizeof(temperature_pressure_calibration)) ||
+                   !readI2C(sda, scl, address, 0xE1,
+                            humidity_calibration, sizeof(humidity_calibration)) ||
+                   !readI2C(sda, scl, address, 0xA1, &humidity_one, 1)) {
+            setError("BME280 calibration read failed");
+        } else if (!writeI2C(sda, scl, address, 0xF2, 0x01) ||
+                   !writeI2C(sda, scl, address, 0xF4, 0x25)) {
+            // Enable humidity x1 first, then trigger temperature/pressure x1
+            // in forced mode; writing ctrl_meas latches ctrl_hum settings.
+            setError("BME280 configuration failed");
+        } else if (!waitForBME280Conversion(sda, scl, address)) {
+            setError("BME280 conversion timeout");
+        } else if (!readI2C(sda, scl, address, 0xF7, bytes, sizeof(bytes))) {
+            setError("BME280 measurement read failed");
+        } else {
             const int pressure = (static_cast<int>(bytes[0]) << 12) | (static_cast<int>(bytes[1]) << 4) | (bytes[2] >> 4);
             const int temperature = (static_cast<int>(bytes[3]) << 12) | (static_cast<int>(bytes[4]) << 4) | (bytes[5] >> 4);
             const int humidity = (static_cast<int>(bytes[6]) << 8) | bytes[7];
-            ludant::BME280Calibration calibration;
-            decodeBME280Calibration(temperature_pressure_calibration, humidity_calibration, calibration);
-            calibration.dig_h1 = humidity_one;
-            double temperature_c = 0.0;
-            double humidity_percent = 0.0;
-            double pressure_hpa = 0.0;
-            if (ludant::compensateBME280(calibration, pressure, temperature, humidity,
-                                         temperature_c, humidity_percent, pressure_hpa)) {
-                addValue("pressure", pressure_hpa);
-                addValue("temperature", temperature_c);
-                addValue("humidity", humidity_percent);
+            if (ludant::bme280MeasurementsWereSkipped(pressure, temperature, humidity)) {
+                setError("BME280 returned skipped sample");
             } else {
-                setError("BME280 compensation failed");
+                ludant::BME280Calibration calibration;
+                decodeBME280Calibration(temperature_pressure_calibration, humidity_calibration, calibration);
+                calibration.dig_h1 = humidity_one;
+                double temperature_c = 0.0;
+                double humidity_percent = 0.0;
+                double pressure_hpa = 0.0;
+                if (!ludant::compensateBME280(calibration, pressure, temperature, humidity,
+                                              temperature_c, humidity_percent, pressure_hpa) ||
+                    !std::isfinite(temperature_c) || !std::isfinite(humidity_percent) ||
+                    !std::isfinite(pressure_hpa) || temperature_c < -40.0 || temperature_c > 85.0 ||
+                    humidity_percent < 0.0 || humidity_percent > 100.0 ||
+                    pressure_hpa < 300.0 || pressure_hpa > 1100.0) {
+                    setError("BME280 compensated values invalid");
+                } else {
+                    addValue("pressure", pressure_hpa);
+                    addValue("temperature", temperature_c);
+                    addValue("humidity", humidity_percent);
+                }
             }
-        } else {
-            setError("BME280 read failed");
         }
     }
     if (use_binary) {
@@ -691,6 +722,37 @@ bool ModuleManager::readI2C(int sda, int scl, int address, uint8_t reg, uint8_t*
     i2c_driver_delete(I2C_NUM_0);
     return result == ESP_OK;
 }
+
+bool ModuleManager::writeI2C(int sda, int scl, int address, uint8_t reg, uint8_t value) const {
+    i2c_config_t config{};
+    config.mode = I2C_MODE_MASTER;
+    config.sda_io_num = static_cast<gpio_num_t>(sda);
+    config.scl_io_num = static_cast<gpio_num_t>(scl);
+    config.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    config.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    config.master.clk_speed = 400000;
+    if (i2c_param_config(I2C_NUM_0, &config) != ESP_OK) return false;
+    if (i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0) != ESP_OK) return false;
+    const uint8_t bytes[] = {reg, value};
+    const esp_err_t result = i2c_master_write_to_device(
+        I2C_NUM_0, static_cast<uint8_t>(address), bytes, sizeof(bytes), pdMS_TO_TICKS(100));
+    i2c_driver_delete(I2C_NUM_0);
+    return result == ESP_OK;
+}
+
+bool ModuleManager::waitForBME280Conversion(int sda, int scl, int address) const {
+    // A forced x1 temperature/pressure/humidity conversion takes about 10 ms.
+    // Let it start, then poll the measuring bit with a bounded timeout.
+    vTaskDelay(pdMS_TO_TICKS(10));
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        uint8_t status = 0;
+        if (!readI2C(sda, scl, address, 0xF3, &status, sizeof(status))) return false;
+        if ((status & 0x08) == 0) return true;
+        vTaskDelay(1);
+    }
+    return false;
+}
+
 bool ModuleManager::readModule(void*, void*) const { return false; }
 
 bool ModuleManager::configureRelay(void* rawModule) const {

@@ -3,10 +3,13 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { validateUsbFlashPackage } from './create-usb-flash-package.mjs';
+import { LAUNCHPAD_BASE_URL, launchpadConfigURL } from './create-launchpad-flash-package.mjs';
 
 const root = path.resolve(import.meta.dirname, '../../../..');
 const catalogPath = path.join(root, 'apps/ui/ludant-ios/ludant-ios/FirmwareCatalog.json');
 const assetsRoot = path.join(root, 'apps/ui/ludant-ios/ludant-ios');
+const launchpadRoot = path.join(root, 'docs/launchpad');
 const projectPath = path.join(root, 'apps/ui/ludant-ios/ludant-ios.xcodeproj/project.pbxproj');
 const otaSlotSize = 1_310_720;
 const versionPattern = /(?:^|-)(\d+)\.(\d+)\.(\d+)$/;
@@ -31,15 +34,15 @@ function compareVersions(left, right) {
 function assertPackageIsBundled(packageName) {
   const lines = xcodeProject.split('\n');
   const fileReferenceLine = lines.find((line) =>
-    line.includes(`/* ${packageName} */ = {isa = PBXFileReference;`) &&
+    line.includes('= {isa = PBXFileReference;') &&
     line.includes(`path = "ludant-ios/FirmwareAssets/${packageName}"`)
   );
   const fileReferenceId = fileReferenceLine?.match(/^\s*([A-F0-9]{24})/)?.[1];
   if (!fileReferenceId) fail(`Xcode project has no folder reference for ${packageName}`);
 
   const buildFileLine = lines.find((line) =>
-    line.includes(`/* ${packageName} in Resources */ = {isa = PBXBuildFile;`) &&
-    line.includes(`fileRef = ${fileReferenceId} /* ${packageName} */;`)
+    line.includes('= {isa = PBXBuildFile;') &&
+    line.includes(`fileRef = ${fileReferenceId} /*`)
   );
   const buildFileId = buildFileLine?.match(/^\s*([A-F0-9]{24})/)?.[1];
   if (!buildFileId) fail(`Xcode project does not copy ${packageName} as an app resource`);
@@ -49,7 +52,7 @@ function assertPackageIsBundled(packageName) {
   const resources = resourcesStart >= 0 && resourcesEnd > resourcesStart
     ? xcodeProject.slice(resourcesStart, resourcesEnd)
     : '';
-  if (!resources.includes(`${buildFileId} /* ${packageName} in Resources */`)) {
+  if (!resources.includes(buildFileId)) {
     fail(`Xcode app Resources phase omits ${packageName}`);
   }
 }
@@ -114,6 +117,20 @@ for (const release of releases) {
        !manifest.moduleSchemas || typeof manifest.moduleSchemas !== 'object')) {
     fail(`ESP-IDF package is missing module metadata: ${release.version}`);
   }
+  if (release.usbAsset !== undefined) {
+    if (typeof release.usbAsset !== 'string' || release.usbAsset.startsWith('/') || release.usbAsset.includes('..')) {
+      fail(`unsafe USB flash package reference: ${release.usbAsset}`);
+    }
+    const usbPackagePath = path.resolve(assetsRoot, release.usbAsset);
+    if (!usbPackagePath.startsWith(`${path.join(assetsRoot, 'FirmwareAssets')}${path.sep}`)) {
+      fail(`USB flash package escapes FirmwareAssets: ${release.usbAsset}`);
+    }
+    if (!fs.statSync(usbPackagePath, { throwIfNoEntry: false })?.isFile()) fail(`missing USB flash package: ${release.usbAsset}`);
+    assertPackageIsBundled(path.basename(usbPackagePath));
+    const usbManifest = validateUsbFlashPackage(usbPackagePath, release.version);
+    const appImage = usbManifest.projectImages?.find((image) => image.path.endsWith('/ludant_esp32s3_ota.bin'));
+    if (!appImage || appImage.sha256 !== manifest.sha256) fail(`USB/OTA application image mismatch: ${release.version}`);
+  }
   if (manifest.runtime !== 'esp-idf') console.warn(`warning: legacy runtime package ${release.version}`);
 }
 
@@ -131,5 +148,49 @@ if (!catalog.latest || typeof catalog.latest.version !== 'string' || typeof cata
 const latestRelease = releases.find((release) => release.version === catalog.latest.version);
 if (!latestRelease) fail(`catalog latest version does not resolve to an artifact: ${catalog.latest.version}`);
 if (latestRelease.asset !== catalog.latest.asset) fail(`catalog latest asset does not match release ${catalog.latest.version}`);
+if (catalog.latest.usbAsset !== latestRelease.usbAsset) fail(`catalog latest USB package does not match release ${catalog.latest.version}`);
+if (catalog.latest.launchpadConfigURL !== latestRelease.launchpadConfigURL) fail(`catalog latest Launchpad config does not match release ${catalog.latest.version}`);
+if (process.env.LUDANT_REQUIRE_ESPIDF === '1' && typeof latestRelease.usbAsset !== 'string') {
+  fail(`production catalog has no USB first-flash package for latest release ${catalog.latest.version}`);
+}
+if (releases.some((release) => release.version !== latestRelease.version && release.usbAsset !== undefined)) {
+  fail('USB first-flash packages should be embedded only for the latest release');
+}
 
-console.log(`Validated ${releases.length} firmware package(s); latest=${catalog.latest.version}`);
+if (process.env.LUDANT_REQUIRE_ESPIDF === '1' && typeof latestRelease.launchpadConfigURL !== 'string') {
+  fail(`production catalog has no Launchpad config URL for latest release ${catalog.latest.version}`);
+}
+if (latestRelease.launchpadConfigURL) {
+  if (latestRelease.launchpadConfigURL !== launchpadConfigURL(LAUNCHPAD_BASE_URL)) {
+    fail(`catalog Launchpad config URL is not the configured Pages URL: ${latestRelease.launchpadConfigURL}`);
+  }
+  if (releases.some((release) => release.version !== latestRelease.version && release.launchpadConfigURL !== undefined)) {
+    fail('Launchpad config URLs should be recorded only for the latest release');
+  }
+  const configPath = path.join(launchpadRoot, 'config.toml');
+  const launchpadManifestPath = path.join(launchpadRoot, 'manifest.json');
+  const config = fs.readFileSync(configPath, 'utf8');
+  const launchpadManifest = JSON.parse(fs.readFileSync(launchpadManifestPath, 'utf8'));
+  if (launchpadManifest.formatVersion !== 1 || launchpadManifest.product !== catalog.product || launchpadManifest.hardware !== catalog.hardware || launchpadManifest.chip !== 'esp32s3') {
+    fail('Launchpad manifest product or format is invalid');
+  }
+  if (launchpadManifest.firmwareVersion !== latestRelease.version) fail('Launchpad/catalog version mismatch');
+  if (typeof launchpadManifest.image !== 'string' || path.basename(launchpadManifest.image) !== launchpadManifest.image) fail('Launchpad image path is unsafe');
+  const launchpadImagePath = path.join(launchpadRoot, launchpadManifest.image);
+  const launchpadImage = fs.readFileSync(launchpadImagePath);
+  if (launchpadImage.length !== launchpadManifest.imageSize || crypto.createHash('sha256').update(launchpadImage).digest('hex') !== launchpadManifest.imageSha256) {
+    fail('Launchpad merged image size or checksum mismatch');
+  }
+  if (!config.includes(`image.esp32-s3 = "${launchpadManifest.image}"`) || !config.includes(`firmware_images_url = "${LAUNCHPAD_BASE_URL}"`)) {
+    fail('Launchpad config does not reference its image directory and generated binary');
+  }
+  if (!fs.existsSync(path.join(launchpadRoot, 'README.md'))) fail('Launchpad setup instructions are missing');
+  const usbManifest = validateUsbFlashPackage(path.resolve(assetsRoot, latestRelease.usbAsset), latestRelease.version);
+  const usbAppImage = usbManifest.projectImages.find((image) => image.path.endsWith('/ludant_esp32s3_ota.bin'));
+  const launchpadAppImage = launchpadManifest.sourceImages.find((image) => image.path.endsWith('/ludant_esp32s3_ota.bin'));
+  if (!usbAppImage || !launchpadAppImage || launchpadAppImage.sha256 !== usbAppImage.sha256) {
+    fail('Launchpad application image does not match the USB/OTA release');
+  }
+}
+
+console.log(`Validated ${releases.length} firmware package(s); latest=${catalog.latest.version}${latestRelease.usbAsset ? ', USB package bundled' : ''}${latestRelease.launchpadConfigURL ? ', Launchpad assets aligned' : ''}`);

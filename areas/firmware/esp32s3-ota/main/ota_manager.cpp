@@ -19,15 +19,17 @@ constexpr uint32_t kProgressInterval = 4U * 1024U;
 OtaManager::OtaManager(OtaPermission& permission, const DeviceInfo& device_info)
     : permission_(permission), device_info_(device_info) {
     mbedtls_md_init(&sha_context_);
-    state_mutex_ = xSemaphoreCreateMutex();
-    data_queue_ = xQueueCreate(kDataQueueCapacity, sizeof(DataChunk));
+    event_queue_ = xQueueCreate(kEventQueueCapacity, sizeof(Event));
     recordCurrentVersion();
 }
 
 bool OtaManager::startDataWorker() {
-    if (data_queue_ == nullptr || state_mutex_ == nullptr) return false;
+    if (event_queue_ == nullptr) return false;
     if (data_worker_ != nullptr) return true;
-    if (xTaskCreate(dataWorkerTask, "ludant_ota_data", 4096, this, 5, &data_worker_) != pdPASS) {
+    // BEGIN performs Ed25519 verification and OTA setup on this owner task.
+    // Leave headroom for the crypto library's call stack as well as queued
+    // event processing; a worker crash here drops BLE before READY is sent.
+    if (xTaskCreate(dataWorkerTask, "ludant_ota_data", 8192, this, 5, &data_worker_) != pdPASS) {
         data_worker_ = nullptr;
         ESP_LOGE(TAG, "Could not start OTA data worker");
         return false;
@@ -37,48 +39,147 @@ bool OtaManager::startDataWorker() {
 
 void OtaManager::dataWorkerTask(void* argument) {
     auto* manager = static_cast<OtaManager*>(argument);
-    while (true) manager->processQueuedData();
+    while (true) manager->processEvents();
 }
 
-void OtaManager::processQueuedData() {
-    if (disconnect_fault_) {
-        disconnect_fault_ = false;
-        abort("BLE client disconnected", false);
-        return;
-    }
-    if (data_queue_fault_) {
-        const char* reason = data_queue_fault_reason_[0] == '\0' ? "OTA data queue fault" : data_queue_fault_reason_;
-        data_queue_fault_ = false;
-        data_queue_fault_reason_[0] = '\0';
-        abort(reason, false);
-        reportError("WRITE_FAILED", reason);
-        return;
-    }
-    DataChunk chunk{};
-    if (xQueueReceive(data_queue_, &chunk, pdMS_TO_TICKS(100)) != pdTRUE) return;
-    if (state_mutex_ != nullptr) xSemaphoreTake(state_mutex_, portMAX_DELAY);
-    queued_bytes_ = queued_bytes_ >= chunk.length ? queued_bytes_ - chunk.length : 0;
-    data_worker_busy_ = true;
-    if (state_mutex_ != nullptr) xSemaphoreGive(state_mutex_);
-    commitData(chunk.data, chunk.length);
-    if (state_mutex_ != nullptr) xSemaphoreTake(state_mutex_, portMAX_DELAY);
-    data_worker_busy_ = false;
-    if (state_mutex_ != nullptr) xSemaphoreGive(state_mutex_);
-}
+void OtaManager::processEvents() {
+    uint32_t notification = 0;
+    if (xTaskNotifyWait(0, UINT32_MAX, &notification, portMAX_DELAY) != pdTRUE) return;
 
-bool OtaManager::waitForDataDrain(uint32_t timeout_ms) {
-    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
-    while (true) {
-        bool drained = data_queue_ == nullptr || uxQueueMessagesWaiting(data_queue_) == 0;
-        if (state_mutex_ != nullptr) {
-            xSemaphoreTake(state_mutex_, portMAX_DELAY);
-            drained = drained && !data_worker_busy_ && queued_bytes_ == 0;
-            xSemaphoreGive(state_mutex_);
+    if ((notification & (kQueueFault | kDisconnect)) != 0) {
+        processEmergency(notification);
+        return;
+    }
+
+    Event event{};
+    while (xQueueReceive(event_queue_, &event, 0) == pdTRUE) {
+        processEvent(event);
+        uint32_t emergency = 0;
+        if (xTaskNotifyWait(0, UINT32_MAX, &emergency, 0) == pdTRUE &&
+            (emergency & (kQueueFault | kDisconnect)) != 0) {
+            processEmergency(emergency);
+            return;
         }
-        if (drained) return true;
-        if (static_cast<int32_t>(xTaskGetTickCount() - deadline) >= 0) return false;
-        vTaskDelay(pdMS_TO_TICKS(5));
     }
+}
+
+void OtaManager::processEvent(const Event& event) {
+    switch (event.type) {
+    case EventType::Begin:
+        if (!begin(event.image_size, event.expected_sha256, event.version, event.product,
+                   event.hardware, event.ota_protocol, event.signature)) {
+            busy_.store(false);
+        }
+        break;
+    case EventType::Data:
+        if (!active_ || !handle_valid_) {
+            reportError("NOT_ACTIVE", "firmware data received without a BEGIN");
+            busy_.store(false);
+            return;
+        }
+        if (received_bytes_ > expected_bytes_ || event.length > expected_bytes_ - received_bytes_) {
+            abort("firmware data exceeded the declared image size", false);
+            reportError("WRITE_FAILED", "firmware data exceeded the declared image size");
+            return;
+        }
+        commitData(event.data, event.length);
+        break;
+    case EventType::Finish:
+        finish();
+        break;
+    case EventType::Abort:
+        abort(event.reason, true);
+        break;
+    }
+}
+
+void OtaManager::processEmergency(uint32_t notification) {
+    if ((notification & kDisconnect) != 0) {
+        abort("BLE client disconnected", false);
+    } else if ((notification & kQueueFault) != 0) {
+        abort("OTA event queue overflow", false);
+        reportError("WRITE_FAILED", "OTA event queue overflow");
+    }
+    if (event_queue_ != nullptr) xQueueReset(event_queue_);
+    busy_.store(false);
+}
+
+void OtaManager::queueEmergency(uint32_t notification) {
+    if (data_worker_ != nullptr) xTaskNotify(data_worker_, notification, eSetBits);
+}
+
+bool OtaManager::enqueueEvent(const Event& event) {
+    if (event_queue_ == nullptr || xQueueSend(event_queue_, &event, 0) != pdTRUE) {
+        queueEmergency(kQueueFault);
+        return false;
+    }
+    if (data_worker_ != nullptr) xTaskNotify(data_worker_, kEventAvailable, eSetBits);
+    return true;
+}
+
+bool OtaManager::enqueueBegin(uint32_t image_size, const char* expected_sha256, const char* version,
+                              const char* product, const char* hardware, uint8_t ota_protocol,
+                              const char* signature_base64) {
+    if (expected_sha256 == nullptr || version == nullptr || product == nullptr || hardware == nullptr ||
+        signature_base64 == nullptr || std::strlen(expected_sha256) >= sizeof(Event{}.expected_sha256) ||
+        std::strlen(version) >= sizeof(Event{}.version) || std::strlen(product) >= sizeof(Event{}.product) ||
+        std::strlen(hardware) >= sizeof(Event{}.hardware) || std::strlen(signature_base64) >= sizeof(Event{}.signature)) {
+        reportError("INVALID_BEGIN", "begin metadata is missing or too long");
+        return false;
+    }
+    bool expected_inactive = false;
+    if (!busy_.compare_exchange_strong(expected_inactive, true)) {
+        reportError("ALREADY_ACTIVE", "an OTA update is already in progress");
+        return false;
+    }
+    Event event{};
+    event.type = EventType::Begin;
+    event.image_size = image_size;
+    event.ota_protocol = ota_protocol;
+    std::strncpy(event.expected_sha256, expected_sha256, sizeof(event.expected_sha256) - 1);
+    std::strncpy(event.version, version, sizeof(event.version) - 1);
+    std::strncpy(event.product, product, sizeof(event.product) - 1);
+    std::strncpy(event.hardware, hardware, sizeof(event.hardware) - 1);
+    std::strncpy(event.signature, signature_base64, sizeof(event.signature) - 1);
+    if (!enqueueEvent(event)) return false;
+    return true;
+}
+
+bool OtaManager::enqueueData(const uint8_t* data, size_t length) {
+    if (!busy_.load()) {
+        reportError("NOT_ACTIVE", "firmware data received without a BEGIN");
+        return false;
+    }
+    if (data == nullptr || length == 0 || length > sizeof(Event{}.data)) {
+        queueEmergency(kQueueFault);
+        return false;
+    }
+    Event event{};
+    event.type = EventType::Data;
+    event.length = static_cast<uint16_t>(length);
+    std::memcpy(event.data, data, length);
+    return enqueueEvent(event);
+}
+
+bool OtaManager::enqueueFinish() {
+    if (!busy_.load()) {
+        reportError("NOT_ACTIVE", "END received without an active OTA update");
+        return false;
+    }
+    Event event{};
+    event.type = EventType::Finish;
+    return enqueueEvent(event);
+}
+
+bool OtaManager::enqueueAbort(const char* reason) {
+    Event event{};
+    event.type = EventType::Abort;
+    if (reason != nullptr) std::strncpy(event.reason, reason, sizeof(event.reason) - 1);
+    return enqueueEvent(event);
+}
+
+void OtaManager::onDisconnect() {
+    if (busy_.load()) queueEmergency(kDisconnect);
 }
 
 void OtaManager::setStatusCallback(OtaStatusCallback callback, void* context) {
@@ -200,7 +301,13 @@ bool OtaManager::begin(uint32_t image_size, const char* expected_sha256, const c
         reportError("VERSION_REJECTED", "firmware version is not newer than the installed version");
         return false;
     }
-    if (!ludant::ota_auth::verifyDigestSignature(expected_digest_, signature_base64)) {
+    ESP_LOGI(TAG, "Verifying OTA signature: workerStackHighWater=%u",
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+    const bool signature_valid = ludant::ota_auth::verifyDigestSignature(expected_digest_, signature_base64);
+    ESP_LOGI(TAG, "OTA signature verification complete: valid=%s workerStackHighWater=%u",
+             signature_valid ? "true" : "false",
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+    if (!signature_valid) {
         reportError("SIGNATURE_INVALID", "firmware signature verification failed");
         return false;
     }
@@ -217,7 +324,12 @@ bool OtaManager::begin(uint32_t image_size, const char* expected_sha256, const c
         return false;
     }
 
-    esp_err_t err = esp_ota_begin(destination_, image_size, &ota_handle_);
+    // Do not erase the entire inactive partition during BEGIN. A full-image
+    // erase can stall the BLE host long enough for iOS to drop the link before
+    // BEGIN is acknowledged. Ordered OTA writes erase only the sectors they
+    // reach, keeping preparation responsive while preserving sequential data
+    // semantics in the single OTA worker.
+    esp_err_t err = esp_ota_begin(destination_, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle_);
     if (err != ESP_OK) {
         destination_ = nullptr;
         reportError("OTA_BEGIN", esp_err_to_name(err));
@@ -232,14 +344,9 @@ bool OtaManager::begin(uint32_t image_size, const char* expected_sha256, const c
     std::strncpy(signature_, signature_base64, sizeof(signature_) - 1);
     expected_bytes_ = image_size;
     received_bytes_ = 0;
-    queued_bytes_ = 0;
-    data_queue_fault_ = false;
-    disconnect_fault_ = false;
-    data_queue_fault_reason_[0] = '\0';
     data_write_count_ = 0;
     data_write_failures_ = 0;
     last_write_duration_us_ = 0;
-    if (data_queue_ != nullptr) xQueueReset(data_queue_);
     next_progress_report_ = std::min(image_size, kProgressInterval);
     handle_valid_ = true;
     active_ = true;
@@ -259,31 +366,6 @@ bool OtaManager::begin(uint32_t image_size, const char* expected_sha256, const c
     return true;
 }
 
-bool OtaManager::enqueueData(const uint8_t* data, size_t length) {
-    if (!active_ || !handle_valid_) {
-        reportError("NOT_ACTIVE", "firmware data received without a BEGIN");
-        return false;
-    }
-    if (data == nullptr || length == 0 || length > kDataChunkCapacity ||
-        received_bytes_ > expected_bytes_ || queued_bytes_ > expected_bytes_ - received_bytes_ ||
-        length > expected_bytes_ - received_bytes_ - queued_bytes_) {
-        setDataQueueFault("firmware data exceeded the declared image size");
-        return false;
-    }
-    DataChunk chunk{};
-    chunk.length = static_cast<uint16_t>(length);
-    std::memcpy(chunk.data, data, length);
-    if (data_queue_ == nullptr || xQueueSend(data_queue_, &chunk, 0) != pdTRUE) {
-        setDataQueueFault(data_queue_ == nullptr ? "OTA data queue unavailable" : "OTA data queue full");
-        return false;
-    }
-    queued_bytes_ += static_cast<uint32_t>(length);
-    ESP_LOGD(TAG, "OTA data queued: chunk=%u received=%u/%u queued=%u depth=%u",
-             static_cast<unsigned>(length), received_bytes_, expected_bytes_, queued_bytes_,
-             static_cast<unsigned>(uxQueueMessagesWaiting(data_queue_)));
-    return true;
-}
-
 bool OtaManager::commitData(const uint8_t* data, size_t length) {
     if (!active_ || !handle_valid_) return false;
 
@@ -293,9 +375,9 @@ bool OtaManager::commitData(const uint8_t* data, size_t length) {
     data_write_count_++;
     if (ota_err != ESP_OK) {
         data_write_failures_++;
-        ESP_LOGE(TAG, "OTA data write failed: err=%s chunk=%u received=%u/%u queued=%u durationUs=%u",
+        ESP_LOGE(TAG, "OTA data write failed: err=%s chunk=%u received=%u/%u durationUs=%u",
                  esp_err_to_name(ota_err), static_cast<unsigned>(length), received_bytes_, expected_bytes_,
-                 queued_bytes_, last_write_duration_us_);
+                 last_write_duration_us_);
         abort(esp_err_to_name(ota_err), false);
         reportError("WRITE_FAILED", esp_err_to_name(ota_err));
         return false;
@@ -307,11 +389,9 @@ bool OtaManager::commitData(const uint8_t* data, size_t length) {
     }
 
     received_bytes_ += static_cast<uint32_t>(length);
-    ESP_LOGD(TAG, "OTA data committed: chunk=%u received=%u/%u queued=%u depth=%u durationUs=%u writes=%u",
-             static_cast<unsigned>(length), received_bytes_, expected_bytes_, queued_bytes_,
-             data_queue_ == nullptr ? 0U : static_cast<unsigned>(uxQueueMessagesWaiting(data_queue_)),
-             last_write_duration_us_, data_write_count_);
-    const bool queue_drained = data_queue_ == nullptr || uxQueueMessagesWaiting(data_queue_) == 0;
+    ESP_LOGD(TAG, "OTA data committed: chunk=%u received=%u/%u durationUs=%u",
+             static_cast<unsigned>(length), received_bytes_, expected_bytes_, last_write_duration_us_);
+    const bool queue_drained = event_queue_ == nullptr || uxQueueMessagesWaiting(event_queue_) == 0;
     if (received_bytes_ >= next_progress_report_ || queue_drained || received_bytes_ == expected_bytes_) {
         char message[64]{};
         std::snprintf(message, sizeof(message), "PROGRESS:%u:%u",
@@ -327,21 +407,9 @@ bool OtaManager::commitData(const uint8_t* data, size_t length) {
     return true;
 }
 
-void OtaManager::setDataQueueFault(const char* reason) {
-    data_queue_fault_ = true;
-    std::strncpy(data_queue_fault_reason_, reason == nullptr ? "OTA data queue fault" : reason,
-                 sizeof(data_queue_fault_reason_) - 1);
-    data_queue_fault_reason_[sizeof(data_queue_fault_reason_) - 1] = '\0';
-}
-
 bool OtaManager::finish() {
     if (!active_ || !handle_valid_) {
         reportError("NOT_ACTIVE", "END received without an active OTA update");
-        return false;
-    }
-    if (!waitForDataDrain(30000)) {
-        abort("OTA data queue did not drain", false);
-        reportError("WRITE_FAILED", "OTA data queue did not drain before END");
         return false;
     }
     if (received_bytes_ != expected_bytes_) {
@@ -404,6 +472,7 @@ bool OtaManager::finish() {
         sha_initialized_ = false;
     }
     report("SUCCESS");
+    busy_.store(false);
     return true;
 }
 
@@ -422,15 +491,6 @@ void OtaManager::abort(const char* reason, bool notify) {
     }
 }
 
-void OtaManager::onDisconnect() {
-    if (active_ || (data_queue_ != nullptr && uxQueueMessagesWaiting(data_queue_) > 0)) {
-        // Let the OTA worker perform esp_ota_abort after any in-flight
-        // esp_ota_write completes; aborting the handle from the NimBLE task
-        // would race the flash write.
-        disconnect_fault_ = true;
-    }
-}
-
 void OtaManager::clearState() {
     ota_handle_ = 0;
     destination_ = nullptr;
@@ -442,12 +502,7 @@ void OtaManager::clearState() {
     expected_sha256_[0] = '\0';
     version_[0] = '\0';
     signature_[0] = '\0';
-    queued_bytes_ = 0;
-    data_queue_fault_ = false;
-    disconnect_fault_ = false;
-    data_queue_fault_reason_[0] = '\0';
-    data_worker_busy_ = false;
-    if (data_queue_ != nullptr) xQueueReset(data_queue_);
+    busy_.store(false);
     std::memset(expected_digest_, 0, sizeof(expected_digest_));
     if (sha_initialized_) {
         mbedtls_md_free(&sha_context_);

@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   assertUnlockedConfiguration,
   disableIrreversibleSecurityOptions,
@@ -74,4 +76,20 @@ test('refuses a board when all USB ROM download paths are disabled', () => {
     .replace('DIS_USB_OTG_DOWNLOAD_MODE (BLOCK0) Disable USB OTG download = False R/W (0b0)', 'DIS_USB_OTG_DOWNLOAD_MODE (BLOCK0) Disable USB OTG download = True R/W (0b1)');
   const parsed = parseUsbFlashEfuses(blocked);
   assert.match(usbFlashEfuseProblem(parsed.values, parsed.missing), /Both USB download paths are disabled/);
+});
+
+test('release and USB flashing paths never burn eFuses or request encrypted writes', () => {
+  const toolsDirectory = import.meta.dirname;
+  const files = [
+    'release-esp-idf-firmware.mjs',
+    'create-launchpad-flash-package.mjs',
+    '../usb-flash-package/flash.py',
+    '../usb-flash-package/flash-macos.command',
+    '../usb-flash-package/flash-windows.bat'
+  ];
+  const sources = files.map((file) => fs.readFileSync(path.resolve(toolsDirectory, file), 'utf8'));
+  const joined = sources.join('\n');
+
+  assert.match(sources[2], /"summary"/);
+  assert.doesNotMatch(joined, /\b(?:burn[_-]?(?:efuse|key)|write[_-]?efuse)\b|--encrypt\b/i);
 });

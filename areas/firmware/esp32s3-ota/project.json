@@ -11,6 +11,20 @@
         "cwd": "{projectRoot}"
       }
     },
+    "test-usb-package": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "node --test tools/create-usb-flash-package.test.mjs tools/usb-flash-asset-transaction.test.mjs",
+        "cwd": "{projectRoot}"
+      }
+    },
+    "validate-catalog": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "node tools/validate-firmware-catalog.mjs",
+        "cwd": "{projectRoot}"
+      }
+    },
     "set-target": {
       "executor": "nx:run-commands",
       "options": {

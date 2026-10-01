@@ -1,0 +1,9 @@
+esp_toml_version = 1.0
+firmware_images_url = "https://nicholascorrie.github.io/ludant/launchpad/"
+supported_apps = ["ludant"]
+
+[ludant]
+chipsets = ["ESP32-S3"]
+image.esp32-s3 = "ludant-2.0.45.bin"
+description = "Ludant controller firmware 2.0.45"
+readme.text = "https://nicholascorrie.github.io/ludant/launchpad/README.md"

@@ -11,6 +11,7 @@
 
 #include <Arduino.h>
 #include <ctype.h>
+#include <cmath>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -708,6 +709,26 @@ bool readI2CRegisterBytes(int address, uint8_t reg, uint8_t* output, size_t leng
   return true;
 }
 
+bool writeI2CRegister(int address, uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(address);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+bool waitForBME280Conversion(int address) {
+  // A forced x1 temperature/pressure/humidity conversion takes about 10 ms.
+  // Let it start, then poll the measuring bit with a bounded timeout.
+  delay(10);
+  for (uint8_t attempt = 0; attempt < 100; ++attempt) {
+    uint8_t status = 0;
+    if (!readI2CRegisterBytes(address, 0xF3, &status, 1)) return false;
+    if ((status & 0x08) == 0) return true;
+    delay(1);
+  }
+  return false;
+}
+
 int16_t signedBME28012(uint16_t value) {
   return static_cast<int16_t>((value & 0x0800) != 0 ? value | 0xF000 : value);
 }
@@ -1262,11 +1283,16 @@ void emitTelemetry() {
       }
     } else {
       uint8_t bytes[8] = {};
+      uint8_t chipId = 0;
+      if (telemetryError.length() == 0 &&
+          (!readI2CRegisterBytes(address, 0xD0, &chipId, 1) || chipId != 0x60)) {
+        telemetryError = "BME280 chip ID mismatch";
+      }
       const bool cacheMatches = bme280CalibrationCache.valid &&
                                 bme280CalibrationCache.sda == sda &&
                                 bme280CalibrationCache.scl == scl &&
                                 bme280CalibrationCache.address == address;
-      if (!cacheMatches) {
+      if (telemetryError.length() == 0 && !cacheMatches) {
         ludant::BME280Calibration calibration;
         bme280CalibrationCache.valid = readBME280Calibration(address, calibration);
         if (bme280CalibrationCache.valid) {
@@ -1277,21 +1303,41 @@ void emitTelemetry() {
           Serial.printf("Ludant: BME280 calibration cached; address=0x%02X, SDA GPIO %d, SCL GPIO %d\n", address, sda, scl);
         }
       }
-      if (bme280CalibrationCache.valid &&
-          readI2CRegisterBytes(address, 0xF7, bytes, sizeof(bytes))) {
+      if (telemetryError.length() == 0 && !bme280CalibrationCache.valid) {
+        telemetryError = "BME280 calibration read failed";
+      }
+      // ctrl_hum takes effect only when ctrl_meas is written. Trigger a fresh
+      // x1 forced-mode conversion for every telemetry sample.
+      if (telemetryError.length() == 0 &&
+          (!writeI2CRegister(address, 0xF2, 0x01) || !writeI2CRegister(address, 0xF4, 0x25))) {
+        telemetryError = "BME280 configuration failed";
+      }
+      if (telemetryError.length() == 0 && !waitForBME280Conversion(address)) {
+        telemetryError = "BME280 conversion timeout";
+      }
+      if (telemetryError.length() == 0 && !readI2CRegisterBytes(address, 0xF7, bytes, sizeof(bytes))) {
+        telemetryError = "BME280 measurement read failed";
+      }
+      if (telemetryError.length() == 0) {
         const int pressure = (static_cast<int>(bytes[0]) << 12) | (static_cast<int>(bytes[1]) << 4) | (bytes[2] >> 4);
         const int temperature = (static_cast<int>(bytes[3]) << 12) | (static_cast<int>(bytes[4]) << 4) | (bytes[5] >> 4);
         const int humidity = (static_cast<int>(bytes[6]) << 8) | bytes[7];
         double temperatureC = 0.0;
         double humidityPercent = 0.0;
         double pressureHpa = 0.0;
-        if (ludant::compensateBME280(bme280CalibrationCache.value, pressure, temperature, humidity,
-                                     temperatureC, humidityPercent, pressureHpa)) {
+        if (ludant::bme280MeasurementsWereSkipped(pressure, temperature, humidity)) {
+          telemetryError = "BME280 returned skipped sample";
+        } else if (ludant::compensateBME280(bme280CalibrationCache.value, pressure, temperature, humidity,
+                                            temperatureC, humidityPercent, pressureHpa) &&
+                   std::isfinite(temperatureC) && std::isfinite(humidityPercent) && std::isfinite(pressureHpa) &&
+                   temperatureC >= -40.0 && temperatureC <= 85.0 &&
+                   humidityPercent >= 0.0 && humidityPercent <= 100.0 &&
+                   pressureHpa >= 300.0 && pressureHpa <= 1100.0) {
           addValue("pressure", pressureHpa);
           addValue("temperature", temperatureC);
           addValue("humidity", humidityPercent);
         } else {
-          telemetryError = "BME280 calibration data is invalid";
+          telemetryError = "BME280 compensated values invalid";
         }
       }
       if (!hasValue && telemetryError.length() == 0) {

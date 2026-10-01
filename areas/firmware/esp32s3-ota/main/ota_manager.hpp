@@ -2,8 +2,8 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
-#include "freertos/semphr.h"
 #include "freertos/task.h"
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -23,24 +23,44 @@ public:
     void setStatusCallback(OtaStatusCallback callback, void* context);
     bool startDataWorker();
     bool authorizationAllowed() const { return permission_.isAllowed(); }
+    bool isActive() const { return busy_.load(); }
+
+    // All lifecycle changes and firmware bytes enter one ordered queue. The
+    // BLE callbacks only copy bounded input and wake the OTA owner task.
+    bool enqueueBegin(uint32_t image_size, const char* expected_sha256, const char* version,
+                      const char* product, const char* hardware, uint8_t ota_protocol,
+                      const char* signature_base64);
+    bool enqueueData(const uint8_t* data, size_t length);
+    bool enqueueFinish();
+    bool enqueueAbort(const char* reason);
+    void onDisconnect();
+
+private:
+    enum class EventType : uint8_t { Begin, Data, Finish, Abort };
+    struct Event {
+        EventType type{EventType::Data};
+        uint32_t image_size{0};
+        uint8_t ota_protocol{0};
+        char expected_sha256[65]{};
+        char version[33]{};
+        char product[32]{};
+        char hardware[32]{};
+        char signature[129]{};
+        char reason[64]{};
+        uint16_t length{0};
+        uint8_t data[512]{};
+    };
+
+    static void dataWorkerTask(void* argument);
+    void processEvents();
+    void processEvent(const Event& event);
+    void processEmergency(uint32_t notification);
     bool begin(uint32_t image_size, const char* expected_sha256, const char* version,
                const char* product, const char* hardware, uint8_t ota_protocol,
                const char* signature_base64);
-    bool enqueueData(const uint8_t* data, size_t length);
     bool finish();
     void abort(const char* reason, bool notify = true);
-    void onDisconnect();
-
-    bool isActive() const { return active_; }
-    uint32_t receivedBytes() const { return received_bytes_; }
-    uint32_t expectedBytes() const { return expected_bytes_; }
-
-private:
-    static void dataWorkerTask(void* argument);
-    void processQueuedData();
-    bool waitForDataDrain(uint32_t timeout_ms);
     bool commitData(const uint8_t* data, size_t length);
-    void setDataQueueFault(const char* reason);
     void clearState();
     void report(const char* message);
     void reportError(const char* code, const char* description);
@@ -49,6 +69,13 @@ private:
     int compareVersions(const char* lhs, const char* rhs) const;
     void recordCurrentVersion();
     bool versionFloor(char* output, size_t capacity) const;
+    bool enqueueEvent(const Event& event);
+    void queueEmergency(uint32_t notification);
+
+    static constexpr uint8_t kEventQueueCapacity = 10;
+    static constexpr uint32_t kEventAvailable = 1U << 0;
+    static constexpr uint32_t kQueueFault = 1U << 1;
+    static constexpr uint32_t kDisconnect = 1U << 2;
 
     OtaPermission& permission_;
     const DeviceInfo& device_info_;
@@ -63,25 +90,14 @@ private:
     uint32_t expected_bytes_{0};
     uint32_t received_bytes_{0};
     uint32_t next_progress_report_{0};
+    uint32_t data_write_count_{0};
+    uint32_t data_write_failures_{0};
+    uint32_t last_write_duration_us_{0};
     char expected_sha256_[65]{};
     char version_[33]{};
     char signature_[129]{};
     uint8_t expected_digest_[32]{};
-    static constexpr size_t kDataChunkCapacity = 512;
-    static constexpr uint8_t kDataQueueCapacity = 8;
-    struct DataChunk {
-        uint8_t data[kDataChunkCapacity]{};
-        uint16_t length{0};
-    };
-    QueueHandle_t data_queue_{nullptr};
-    SemaphoreHandle_t state_mutex_{nullptr};
+    QueueHandle_t event_queue_{nullptr};
     TaskHandle_t data_worker_{nullptr};
-    uint32_t queued_bytes_{0};
-    uint32_t data_write_count_{0};
-    uint32_t data_write_failures_{0};
-    uint32_t last_write_duration_us_{0};
-    bool data_worker_busy_{false};
-    bool data_queue_fault_{false};
-    bool disconnect_fault_{false};
-    char data_queue_fault_reason_[64]{};
+    std::atomic<bool> busy_{false};
 };

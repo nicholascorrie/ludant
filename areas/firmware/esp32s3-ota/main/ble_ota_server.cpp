@@ -13,6 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "host/ble_hs.h"
+#include "host/ble_store.h"
 #include "host/ble_uuid.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -136,11 +137,15 @@ esp_err_t BleOtaServer::start() {
         return ESP_ERR_NO_MEM;
     }
     advertising_ready_ = xSemaphoreCreateBinary();
-    if (advertising_ready_ == nullptr) {
+    status_mutex_ = xSemaphoreCreateMutex();
+    if (advertising_ready_ == nullptr || status_mutex_ == nullptr) {
         return ESP_ERR_NO_MEM;
     }
     telemetry_queue_ = xQueueCreate(16, sizeof(ludant::BinaryTelemetryPacket));
-    status_queue_ = xQueueCreate(4, sizeof(QueuedStatus*));
+    // Keep room for lifecycle/error messages even when progress is arriving
+    // quickly. Progress is expendable because it is recoverable from the
+    // readable last-status characteristic.
+    status_queue_ = xQueueCreate(12, sizeof(QueuedStatus*));
     if (telemetry_queue_ == nullptr || status_queue_ == nullptr ||
         xTaskCreate(telemetryTask, "ludant_binary_telemetry", 3072, this, 4, &telemetry_task_) != pdPASS ||
         xTaskCreate(statusTask, "ludant_ble_status", 4096, this, 5, &status_task_) != pdPASS) {
@@ -160,6 +165,8 @@ esp_err_t BleOtaServer::start() {
     ble_hs_cfg.sm_sc = 1;
     ble_hs_cfg.sm_mitm = 0;
     ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
+    ESP_LOGI(TAG, "BLE bonding configured: secure_connections=1, mitm=0, max_bonds=%d, persistent_store=1",
+             CONFIG_BT_NIMBLE_MAX_BONDS);
 
     ble_svc_gap_init();
     ble_svc_gatt_init();
@@ -278,6 +285,7 @@ void BleOtaServer::handleStatus(const char* message) {
         return;
     }
     const size_t message_length = std::strlen(message);
+    if (status_mutex_ != nullptr) xSemaphoreTake(status_mutex_, portMAX_DELAY);
     const size_t saved_length = std::min(message_length, sizeof(last_status_) - 1);
     if (message_length < sizeof(last_status_)) {
         std::memcpy(last_status_, message, saved_length);
@@ -287,6 +295,7 @@ void BleOtaServer::handleStatus(const char* message) {
         std::strncpy(last_status_, "RESPONSE_AVAILABLE", sizeof(last_status_) - 1);
         last_status_[sizeof(last_status_) - 1] = '\0';
     }
+    if (status_mutex_ != nullptr) xSemaphoreGive(status_mutex_);
     if (message_length > kMaxStatusMessageLength) {
         ESP_LOGE(TAG, "Status message exceeds framing limit: bytes=%u maximum=%u",
                  static_cast<unsigned>(message_length), static_cast<unsigned>(kMaxStatusMessageLength));
@@ -320,9 +329,16 @@ void BleOtaServer::notifyStatus(const char* message) {
     status->length = message_length;
     std::memcpy(status->data, message, message_length);
     status->data[message_length] = '\0';
+    const bool is_progress = std::strncmp(message, "PROGRESS:", 9) == 0;
+    constexpr UBaseType_t kReservedCriticalStatusSlots = 4;
+    if (is_progress && uxQueueSpacesAvailable(status_queue_) <= kReservedCriticalStatusSlots) {
+        ESP_LOGD(TAG, "Coalescing progress status while preserving lifecycle queue capacity");
+        delete status;
+        return;
+    }
     if (xQueueSend(status_queue_, &status, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "Status notification queue is full; dropping message bytes=%u",
-                 static_cast<unsigned>(message_length));
+        ESP_LOGW(TAG, "Status notification queue is full; dropping %s message bytes=%u",
+                 is_progress ? "progress" : "critical", static_cast<unsigned>(message_length));
         delete status;
     }
 }
@@ -427,7 +443,9 @@ void BleOtaServer::handleDisconnect() {
 int BleOtaServer::handleRead(uint16_t attr_handle, struct ble_gatt_access_ctxt* ctxt) {
     std::string value;
     if (attr_handle == status_handle) {
+        if (status_mutex_ != nullptr) xSemaphoreTake(status_mutex_, portMAX_DELAY);
         value = last_status_;
+        if (status_mutex_ != nullptr) xSemaphoreGive(status_mutex_);
     } else if (attr_handle == device_info_handle) {
         value = device_info_.json();
     } else {
@@ -479,7 +497,7 @@ int BleOtaServer::handleCompleteControlWrite(const char* message, size_t length)
     }
     cJSON* root = cJSON_ParseWithLength(message, length);
     if (root == nullptr) {
-        ota_manager_.abort("malformed control JSON");
+        ota_manager_.enqueueAbort("malformed control JSON");
         handleStatus("ERROR:INVALID_JSON:control message is not valid JSON");
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
@@ -515,7 +533,7 @@ int BleOtaServer::handleCompleteControlWrite(const char* message, size_t length)
             cJSON_IsString(algorithm_item) && cJSON_IsString(value_item) &&
             size_item->valuedouble >= 1.0 && size_item->valuedouble <= 4294967295.0 &&
             size_item->valuedouble == static_cast<double>(static_cast<uint32_t>(size_item->valuedouble))) {
-            accepted = ota_manager_.begin(
+            accepted = ota_manager_.enqueueBegin(
                 static_cast<uint32_t>(size_item->valuedouble),
                 sha_item->valuestring,
                 version_item->valuestring,
@@ -527,10 +545,9 @@ int BleOtaServer::handleCompleteControlWrite(const char* message, size_t length)
             handleStatus("ERROR:INVALID_BEGIN:begin requires integer size, sha256, and version");
         }
     } else if (std::strcmp(command_item->valuestring, "end") == 0) {
-        accepted = ota_manager_.finish();
+        accepted = ota_manager_.enqueueFinish();
     } else if (std::strcmp(command_item->valuestring, "abort") == 0) {
-        ota_manager_.abort("client requested abort");
-        accepted = true;
+        accepted = ota_manager_.enqueueAbort("client requested abort");
     } else {
         if (ota_manager_.isActive()) {
             handleStatus("ERROR:OTA_BUSY:controller commands are disabled during firmware update");
@@ -693,7 +710,7 @@ int BleOtaServer::handleDataWrite(struct ble_gatt_access_ctxt* ctxt) {
     while (offset < length) {
         const uint16_t chunk_length = std::min<uint16_t>(kCopyChunkSize, length - offset);
         if (os_mbuf_copydata(ctxt->om, offset, chunk_length, copy_buffer) != 0) {
-            ota_manager_.abort("could not read BLE data buffer");
+            ota_manager_.enqueueAbort("could not read BLE data buffer");
             return BLE_ATT_ERR_UNLIKELY;
         }
         if (!ota_manager_.enqueueData(copy_buffer, chunk_length)) {
@@ -808,6 +825,14 @@ int BleOtaServer::gapEvent(struct ble_gap_event* event, void*) {
                 // callback reaching the controller.
                 instance_->resetCommandFrame();
                 instance_->module_manager_.stopTelemetry();
+                struct ble_gap_conn_desc desc{};
+                if (ble_gap_conn_find(event->connect.conn_handle, &desc) == 0) {
+                    ESP_LOGI(TAG, "BLE connection peer: handle=%u addr_type=%u addr=%02X:%02X:%02X:%02X:%02X:%02X bonded=%u encrypted=%u",
+                             event->connect.conn_handle, desc.peer_id_addr.type,
+                             desc.peer_id_addr.val[5], desc.peer_id_addr.val[4], desc.peer_id_addr.val[3],
+                             desc.peer_id_addr.val[2], desc.peer_id_addr.val[1], desc.peer_id_addr.val[0],
+                             desc.sec_state.bonded, desc.sec_state.encrypted);
+                }
                 const int security_rc = ble_gap_security_initiate(event->connect.conn_handle);
                 if (security_rc != 0) {
                     ESP_LOGW(TAG, "BLE security negotiation could not start: status=%d", security_rc);
@@ -823,6 +848,46 @@ int BleOtaServer::gapEvent(struct ble_gap_event* event, void*) {
             instance_->handleDisconnect();
             instance_->advertise();
             break;
+        case BLE_GAP_EVENT_ENC_CHANGE:
+            {
+                struct ble_gap_conn_desc desc{};
+                const int desc_rc = ble_gap_conn_find(event->enc_change.conn_handle, &desc);
+                if (event->enc_change.status == 0) {
+                    ESP_LOGI(TAG, "BLE encryption change: handle=%u status=ok descriptor=%d encrypted=%u authenticated=%u bonded=%u secure_connections=%u key_size=%u",
+                             event->enc_change.conn_handle, desc_rc,
+                             desc_rc == 0 ? desc.sec_state.encrypted : 0,
+                             desc_rc == 0 ? desc.sec_state.authenticated : 0,
+                             desc_rc == 0 ? desc.sec_state.bonded : 0,
+                             desc_rc == 0 ? desc.sec_state.sc : 0,
+                             desc_rc == 0 ? desc.sec_state.key_size : 0);
+                } else {
+                    ESP_LOGW(TAG, "BLE encryption change: handle=%u status=%d descriptor=%d",
+                             event->enc_change.conn_handle, event->enc_change.status, desc_rc);
+                }
+            }
+            break;
+        case BLE_GAP_EVENT_REPEAT_PAIRING: {
+            struct ble_gap_conn_desc desc{};
+            const int rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
+            if (rc != 0) {
+                ESP_LOGE(TAG, "Could not find connection for repeat pairing: handle=%u status=%d",
+                         event->repeat_pairing.conn_handle, rc);
+                return BLE_GAP_REPEAT_PAIRING_IGNORE;
+            }
+
+            const int delete_rc = ble_store_util_delete_peer(&desc.peer_id_addr);
+            if (delete_rc != 0) {
+                ESP_LOGE(TAG, "Could not remove stale BLE bond: handle=%u status=%d",
+                         event->repeat_pairing.conn_handle, delete_rc);
+                return BLE_GAP_REPEAT_PAIRING_IGNORE;
+            }
+
+            ESP_LOGW(TAG, "Removed stale BLE bond; retrying pairing: handle=%u peer_addr_type=%u peer_addr=%02X:%02X:%02X:%02X:%02X:%02X",
+                     event->repeat_pairing.conn_handle, desc.peer_id_addr.type,
+                     desc.peer_id_addr.val[5], desc.peer_id_addr.val[4], desc.peer_id_addr.val[3],
+                     desc.peer_id_addr.val[2], desc.peer_id_addr.val[1], desc.peer_id_addr.val[0]);
+            return BLE_GAP_REPEAT_PAIRING_RETRY;
+        }
         case BLE_GAP_EVENT_ADV_COMPLETE:
             instance_->advertise();
             break;
@@ -832,7 +897,11 @@ int BleOtaServer::gapEvent(struct ble_gap_event* event, void*) {
                 ESP_LOGI(TAG, "Status notifications %s",
                          instance_->status_notifications_enabled_ ? "enabled" : "disabled");
                 if (instance_->status_notifications_enabled_) {
-                    instance_->notifyStatus(instance_->last_status_);
+                    char last_status[sizeof(instance_->last_status_)]{};
+                    if (instance_->status_mutex_ != nullptr) xSemaphoreTake(instance_->status_mutex_, portMAX_DELAY);
+                    std::strncpy(last_status, instance_->last_status_, sizeof(last_status) - 1);
+                    if (instance_->status_mutex_ != nullptr) xSemaphoreGive(instance_->status_mutex_);
+                    instance_->notifyStatus(last_status);
                 }
             } else if (event->subscribe.attr_handle == telemetry_handle) {
                 instance_->telemetry_notifications_enabled_ = event->subscribe.cur_notify != 0;
