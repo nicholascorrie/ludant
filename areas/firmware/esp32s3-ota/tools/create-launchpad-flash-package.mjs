@@ -41,7 +41,6 @@ export function launchpadConfigURL(baseURL = LAUNCHPAD_BASE_URL) {
 export function launchpadShareURL(configURL) {
   const url = new URL(ESP_LAUNCHPAD_URL);
   url.searchParams.set('flashConfigURL', configURL);
-  url.searchParams.set('crossDomain', 'true');
   return url.toString();
 }
 

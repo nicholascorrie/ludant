@@ -97,7 +97,7 @@ test('creates a merged Launchpad image and public config from the validated USB 
   assert.match(readme, /does not burn eFuses/);
   assert.match(readme, /install other compatible firmware later/);
   assert.equal(new URL(result.shareURL).searchParams.get('flashConfigURL'), result.configURL);
-  assert.equal(new URL(launchpadShareURL(result.configURL)).searchParams.get('crossDomain'), 'true');
+  assert.equal(new URL(launchpadShareURL(result.configURL)).searchParams.has('crossDomain'), false);
 });
 
 test('rejects a Launchpad package whose version differs from its USB source package', (t) => {
