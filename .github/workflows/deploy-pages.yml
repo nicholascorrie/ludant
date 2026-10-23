@@ -1,6 +1,5 @@
 name: Deploy firmware flasher assets
 
-
 on:
   push:
     branches:
@@ -8,6 +7,7 @@ on:
     paths:
       - 'docs/launchpad/**'
       - 'docs/privacy/**'
+      - 'docs/support/**'
       - '.github/workflows/deploy-pages.yml'
   workflow_dispatch:
 
